@@ -85,10 +85,10 @@ class AlphaZeroTrainer(AlphaZero):
         obs: chex.Array,
     ) -> chex.Array:
         pi_logits, value = self.network.apply(params, obs)
-        pi_loss = optax.softmax_cross_entropy(logits=pi_logits, labels=pi_target)
-        value_loss = optax.l2_loss(value_target, value)
+        pi_loss = optax.softmax_cross_entropy(pi_logits, pi_target).mean()
+        value_loss = optax.l2_loss(value_target, value).mean()
 
-        return jnp.mean(pi_loss + value_loss)
+        return pi_loss + value_loss
 
     def _step_env(
         self, state: TrainState, actions: chex.Array
@@ -132,17 +132,18 @@ class AlphaZeroTrainer(AlphaZero):
 
         dirichlet_noise = jax.random.dirichlet(
             noise_key,
-            alpha=jnp.full(
-                self.env.action_spec.num_values, self.config.dirichlet_alpha
-            ),
+            jnp.full(self.env.action_spec.num_values, self.config.dirichlet_alpha),
             shape=(self.config.batch_size,),
         )
 
+        action_mask = state.env_states.action_mask  # type: ignore
         noisy_priors = (
             prior_probs * (1 - self.config.dirichlet_mix)
             + dirichlet_noise * self.config.dirichlet_mix
         )
-        noisy_logits = jnp.where(noisy_priors > 0, jnp.log(noisy_priors), -1e10)
+        noisy_logits = jnp.where(
+            (noisy_priors > 0) & action_mask, jnp.log(noisy_priors), -1e10
+        )
 
         policy_output = self._policy_output(
             params=state.params,
@@ -206,7 +207,7 @@ class AlphaZeroTrainer(AlphaZero):
                 raise AssertionError("Unknown value target")
 
             env_obs = batch_obs(state.env_states)
-            _, grads = self._compute_gradients(
+            loss, grads = self._compute_gradients(
                 state.params, search_policy, search_value, env_obs
             )
             state = self._apply_updates(state, grads)
