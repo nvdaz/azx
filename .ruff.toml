@@ -1,0 +1,7 @@
+line-length = 88
+target-version = "py38"
+fix = true
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+[format]
+quote-style = "double"

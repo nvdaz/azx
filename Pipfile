@@ -1,0 +1,18 @@
+[requires]
+python_version = "3.8"
+
+[packages]
+jax = ">=0.6.0"
+chex = ">=0.1.89"
+mctx = ">=0.0.5"
+orbax = ">=0.1.9"
+dm-haiku = "*"
+optax = "*"
+jumanji = "*"
+
+[dev-packages]
+ruff = {version = "*", extras = ["format"]}
+
+[scripts]
+lint = "ruff check ."
+format = "ruff format ."
