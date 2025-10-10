@@ -34,12 +34,12 @@ class AlphaZero:
 
     def _recurrent_fn(
         self,
-        params:hk.MutableParams,
+        packed_params: tuple[hk.MutableParams, hk.MutableState],
         key: chex.PRNGKey,
         actions: chex.Array,
-        embedding: tuple,
+        env_states: chex.Array,
     ):
-        net_state, env_states = embedding
+        params, net_state = packed_params
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
         batch_rewards = jax.vmap(lambda x: x.reward, in_axes=(0,))
@@ -59,7 +59,7 @@ class AlphaZero:
                 prior_logits=pi_logits,  # type: ignore
                 value=value,  # type: ignore
             ),
-            (net_state, env_states),
+            env_states,
         )
 
     def _policy_output(
@@ -74,11 +74,11 @@ class AlphaZero:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
             value=value,  # type: ignore
-            embedding=(net_state, env_states),  # type: ignore
+            embedding=env_states,  # type: ignore
         )
 
         return mctx.gumbel_muzero_policy(
-            params=params,
+            params=(params, net_state),
             rng_key=key,
             root=root,
             recurrent_fn=self._recurrent_fn,
@@ -101,7 +101,9 @@ class AlphaZero:
         env_state: Any,
     ) -> int:
         key, subkey = jax.random.split(key)
-        (pi_logits, value), _ = self.network.apply(params, net_state, subkey, self.obs_fn(env_state)[None, ...])
+        (pi_logits, value), _ = self.network.apply(
+            params, net_state, subkey, self.obs_fn(env_state)[None, ...]
+        )
 
         policy_output = self._policy_output(
             params=params,
