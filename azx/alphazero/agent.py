@@ -30,15 +30,20 @@ class AlphaZero:
     ):
         self.env = env
         self.config = config
-        self.network = hk.without_apply_rng(hk.transform(network_fn))
+        self.network = hk.transform_with_state(network_fn)
         self.obs_fn = obs_fn
 
     def _recurrent_fn(
-        self, params: optax.Params, _: chex.PRNGKey, actions: chex.Array, env_states
+        self,
+        params:hk.MutableParams,
+        key: chex.PRNGKey,
+        actions: chex.Array,
+        embedding: tuple,
     ):
+        net_state, env_states = embedding
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
-        batch_apply = jax.vmap(self.network.apply, in_axes=(None, 0))
+        batch_apply = jax.vmap(self.network.apply, in_axes=(None, None, 0, 0))
         batch_rewards = jax.vmap(lambda x: x.reward, in_axes=(0,))
         batch_terminals = jax.vmap(lambda x: x.last(), in_axes=(0,))
 
@@ -47,7 +52,8 @@ class AlphaZero:
         rewards = batch_rewards(steps)
         terminals = batch_terminals(steps)
 
-        pi_logits, value = batch_apply(params, obs)
+        net_keys = jax.random.split(key, obs.shape[0])
+        (pi_logits, value), _ = batch_apply(params, net_state, net_keys, obs)
 
         return (
             mctx.RecurrentFnOutput(
@@ -56,12 +62,13 @@ class AlphaZero:
                 prior_logits=pi_logits,  # type: ignore
                 value=value,  # type: ignore
             ),
-            env_states,
+            (net_state, env_states),
         )
 
     def _policy_output(
         self,
-        params: optax.Params,
+        params: hk.MutableParams,
+        net_state: hk.MutableState,
         key: chex.PRNGKey,
         env_states: Any,
         pi_logits: chex.Array,
@@ -70,7 +77,7 @@ class AlphaZero:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
             value=value,  # type: ignore
-            embedding=env_states,  # type: ignore
+            embedding=(net_state, env_states),  # type: ignore
         )
 
         return mctx.gumbel_muzero_policy(
@@ -89,11 +96,19 @@ class AlphaZero:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def predict(self, params: optax.Params, key: chex.PRNGKey, env_state: Any) -> int:
-        pi_logits, value = self.network.apply(params, self.obs_fn(env_state))
+    def predict(
+        self,
+        params: hk.MutableParams,
+        net_state: hk.MutableState,
+        key: chex.PRNGKey,
+        env_state: Any,
+    ) -> int:
+        key, subkey = jax.random.split(key)
+        (pi_logits, value), _ = self.network.apply(params, net_state, subkey, self.obs_fn(env_state))
 
         policy_output = self._policy_output(
             params=params,
+            net_state=net_state,
             key=key,
             env_states=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state),
             pi_logits=jnp.expand_dims(pi_logits, axis=0),

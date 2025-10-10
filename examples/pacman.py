@@ -80,6 +80,7 @@ config = TrainConfig(
 
 def make_cnn_policy_value(action_dim: int) -> Callable[[jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
     def net_fn(obs: jnp.ndarray):  # obs: (H, W, C) per sample (no batch dim)
+        chex.assert_shape(obs, (31, 28, 10))
         x = obs.astype(jnp.float32)
         x = hk.Conv2D(32, kernel_shape=3, padding="SAME")(x); x = jax.nn.relu(x)
         x = hk.Conv2D(64, kernel_shape=3, padding="SAME")(x); x = jax.nn.relu(x)
