@@ -7,7 +7,6 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import mctx
-import optax
 from jumanji.env import Environment
 
 
@@ -43,7 +42,6 @@ class AlphaZero:
         net_state, env_states = embedding
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
-        batch_apply = jax.vmap(self.network.apply, in_axes=(None, None, 0, 0))
         batch_rewards = jax.vmap(lambda x: x.reward, in_axes=(0,))
         batch_terminals = jax.vmap(lambda x: x.last(), in_axes=(0,))
 
@@ -52,8 +50,7 @@ class AlphaZero:
         rewards = batch_rewards(steps)
         terminals = batch_terminals(steps)
 
-        net_keys = jax.random.split(key, obs.shape[0])
-        (pi_logits, value), _ = batch_apply(params, net_state, net_keys, obs)
+        (pi_logits, value), _ = self.network.apply(params, net_state, key, obs)
 
         return (
             mctx.RecurrentFnOutput(
@@ -104,15 +101,15 @@ class AlphaZero:
         env_state: Any,
     ) -> int:
         key, subkey = jax.random.split(key)
-        (pi_logits, value), _ = self.network.apply(params, net_state, subkey, self.obs_fn(env_state))
+        (pi_logits, value), _ = self.network.apply(params, net_state, subkey, self.obs_fn(env_state)[None, ...])
 
         policy_output = self._policy_output(
             params=params,
             net_state=net_state,
             key=key,
             env_states=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state),
-            pi_logits=jnp.expand_dims(pi_logits, axis=0),
-            value=jnp.expand_dims(value, axis=0),
+            pi_logits=pi_logits,
+            value=value,
         )
 
         return policy_output.action[0]  # type: ignore

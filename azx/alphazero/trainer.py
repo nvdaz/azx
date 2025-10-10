@@ -63,7 +63,7 @@ class AlphaZeroTrainer(AlphaZero):
         state, _ = self.env.reset(subkey)
 
         key, subkey = jax.random.split(key)
-        params, net_state = self.network.init(subkey, self.obs_fn(state))
+        params, net_state = self.network.init(subkey, self.obs_fn(state)[None, ...])
 
         opt_state = self.opt.init(params)
 
@@ -139,14 +139,12 @@ class AlphaZeroTrainer(AlphaZero):
         self, state: TrainState
     ) -> tuple[TrainState, mctx.PolicyOutput]:
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
-        batch_apply = jax.vmap(self.network.apply, in_axes=(None, None, 0, 0))
 
         env_obs = batch_obs(state.env_states)
 
         key, subkey = jax.random.split(state.key)
-        net_keys = jax.random.split(subkey, env_obs.shape[0])
-        (pi_logits, value), net_state = batch_apply(
-            state.params, state.net_state, net_keys, env_obs
+        (pi_logits, value), net_state = self.network.apply(
+            state.params, state.net_state, subkey, env_obs
         )
 
         key, subkey = jax.random.split(key)
@@ -188,15 +186,9 @@ class AlphaZeroTrainer(AlphaZero):
         search_value: chex.Array,
         obs: chex.Array,
     ) -> tuple[chex.Array, chex.Array]:
-        net_keys = jax.random.split(key, search_policy.shape[0])
-
-        def bloss(*args):
-            loss, aux = jax.vmap(self._loss_fn, in_axes=(None, None, 0, 0, 0, 0))(*args)
-            return jnp.mean(loss), aux
-
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
-            bloss, argnums=0, has_aux=True
-        )(params, net_state, net_keys, search_policy, search_value, obs)
+            self._loss_fn, argnums=0, has_aux=True
+        )(params, net_state, key, search_policy, search_value, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 

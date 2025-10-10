@@ -79,18 +79,20 @@ config = TrainConfig(
 
 
 def make_cnn_policy_value(action_dim: int) -> Callable[[jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
-    def net_fn(obs: jnp.ndarray):  # obs: (H, W, C) per sample (no batch dim)
-        chex.assert_shape(obs, (31, 28, 10))
+    def net_fn(obs: jnp.ndarray):  # obs: (N, H, W, C) per sample (no batch dim)
+        chex.assert_shape(obs, (None, 31, 28, 10))
         x = obs.astype(jnp.float32)
-        x = hk.Conv2D(32, kernel_shape=3, padding="SAME")(x); x = jax.nn.relu(x)
-        x = hk.Conv2D(64, kernel_shape=3, padding="SAME")(x); x = jax.nn.relu(x)
-        x = jnp.mean(x, axis=(0, 1))
+        x = hk.Conv2D(32, kernel_shape=3, padding="SAME")(x)
+        x = jax.nn.relu(x)
+        x = hk.Conv2D(64, kernel_shape=3, padding="SAME")(x)
+        x = jax.nn.relu(x)
+        x = jnp.mean(x, axis=(1, 2))
         x = hk.Linear(128)(x); x = jax.nn.relu(x)
-        pi_logits = hk.Linear(action_dim)(x)    # (action_dim,)
-        value = hk.Linear(1)(x)                 # (1,)
+        pi_logits = hk.Linear(action_dim)(x)    # (N, action_dim,)
+        value = hk.Linear(1)(x)                 # (N, 1,)
 
-        chex.assert_shape(pi_logits, (action_dim,))
-        chex.assert_shape(value, (1,))
+        chex.assert_shape(pi_logits, (None, action_dim,))
+        chex.assert_shape(value, (None, 1,))
 
         return pi_logits, jnp.squeeze(value, -1)  # value -> ()
     return net_fn

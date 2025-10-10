@@ -1,6 +1,7 @@
 import pathlib
 
 import haiku as hk
+import chex
 import jax
 import jax.numpy as jnp
 import optax
@@ -9,6 +10,7 @@ from jumanji.environments.routing.maze.generator import RandomGenerator
 from jumanji.environments.routing.maze.types import State
 
 from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
+
 
 config = TrainConfig(
     discount=0.99,
@@ -28,6 +30,7 @@ config = TrainConfig(
 
 def make_network_fn(action_dim: int):
     def net_fn(obs: jnp.ndarray):
+        chex.assert_shape(obs, (None, None))
         x = hk.Linear(64)(obs)
         x = jax.nn.relu(x)
         x = hk.Linear(64)(x)
@@ -60,8 +63,10 @@ def flatten_observation(obs: State) -> jnp.ndarray:
 env = Maze(RandomGenerator(5, 5))
 action_dim = env.action_spec.num_values
 
+
 def action_mask_fn(state):
     return state.action_mask
+
 
 trainer = AlphaZeroTrainer(
     env=env,
