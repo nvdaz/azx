@@ -18,3 +18,6 @@ dependencies = [
   "jumanji",
 ]
 
+[tool.setuptools.packages.find]
+include = ["azx*"]
+
