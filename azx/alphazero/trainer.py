@@ -19,6 +19,7 @@ from .agent import AlphaZero, Config, ModelState
 class TrainConfig(Config):
     batch_size: int
     eval_frequency: int
+    max_eval_steps: int
     avg_return_smoothing: float
     value_target: Literal["maxq", "nodev"]
     dirichlet_alpha: float
@@ -281,8 +282,8 @@ class AlphaZeroTrainer(AlphaZero):
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 
-        def loop_fn(_, carry):
-            env_states, reward_acc, done_mask, key = carry
+        def loop_fn(carry):
+            env_states, reward_acc, done_mask, key, iter = carry
             key, subkey = jax.random.split(key)
             step_keys = jax.random.split(subkey, self.config.batch_size)
 
@@ -297,7 +298,7 @@ class AlphaZeroTrainer(AlphaZero):
             reward_acc = jnp.where(done_mask, reward_acc, reward_acc + r)
             done_mask = jnp.logical_or(done_mask, done)
 
-            return next_states, reward_acc, done_mask, key
+            return next_states, reward_acc, done_mask, key, iter + 1
 
         key, subkey = jax.random.split(state.key)
         reset_keys = jax.random.split(subkey, self.config.batch_size)
@@ -306,8 +307,11 @@ class AlphaZeroTrainer(AlphaZero):
         reward_acc = jnp.zeros(self.config.batch_size)
         done_mask = jnp.zeros(self.config.batch_size, dtype=jnp.bool_)
 
-        _, reward_acc, _, _ = jax.lax.fori_loop(
-            0, max_steps, loop_fn, (env_states, reward_acc, done_mask, key)
+        _, reward_acc, _, _, _ = jax.lax.while_loop(
+            lambda carry: jnp.any(~carry[2])
+            & (carry[4] < max_steps),  # while any not done and iters under max steps
+            loop_fn,
+            (env_states, reward_acc, done_mask, key, 0),
         )
 
         return jnp.mean(reward_acc)
@@ -333,7 +337,7 @@ class AlphaZeroTrainer(AlphaZero):
             returns.append(avg_return)
             time_step += self.config.eval_frequency
             steps.append(time_step)
-            ev = self.evaluate(state, 100)
+            ev = self.evaluate(state, self.config.max_eval_steps)
 
             print(
                 f"Step {time_step} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "

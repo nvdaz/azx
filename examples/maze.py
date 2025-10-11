@@ -21,6 +21,7 @@ config = TrainConfig(
     avg_return_smoothing=0.99,
     num_simulations=5,
     eval_frequency=200,
+    max_eval_steps=1000,
     dirichlet_alpha=0.3,
     dirichlet_mix=0,
     checkpoint_frequency=1000,
