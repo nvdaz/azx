@@ -12,7 +12,7 @@ import optax
 import orbax.checkpoint as ocp
 from jumanji.env import Environment
 
-from .agent import AlphaZero, Config
+from .agent import AlphaZero, Config, ModelState
 
 
 @dataclasses.dataclass
@@ -168,8 +168,7 @@ class AlphaZeroTrainer(AlphaZero):
         noisy_logits = jnp.where(valid, jnp.log(noisy_priors), -1e10)
 
         policy_output = self._policy_output(
-            params=state.params,
-            net_state=state.net_state,
+            model=ModelState(state.params, state.net_state),
             key=mcts_key,
             env_states=state.env_states,
             pi_logits=noisy_logits,
@@ -180,8 +179,7 @@ class AlphaZeroTrainer(AlphaZero):
 
     def _compute_gradients(
         self,
-        params: hk.MutableParams,
-        net_state: hk.MutableState,
+        model: ModelState,
         key: chex.Array,
         search_policy: chex.Array,
         search_value: chex.Array,
@@ -189,7 +187,7 @@ class AlphaZeroTrainer(AlphaZero):
     ) -> tuple[chex.Array, chex.Array]:
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(params, net_state, key, search_policy, search_value, obs)
+        )(model.params, model.state, key, search_policy, search_value, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
@@ -228,7 +226,11 @@ class AlphaZeroTrainer(AlphaZero):
             key, subkey = jax.random.split(state.key)
 
             (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                state.params, state.net_state, subkey, pi_target, v_target, env_obs
+                ModelState(state.params, state.net_state),
+                subkey,
+                pi_target,
+                v_target,
+                env_obs,
             )
             state = self._apply_updates(state, grads)
             state, reward, terminals = self._step_env(state, policy_output.action)
@@ -273,7 +275,9 @@ class AlphaZeroTrainer(AlphaZero):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
         def single_action(env_state, key):
-            return self.predict(state.params, state.net_state, key, env_state)
+            return self.predict(
+                ModelState(state.params, state.net_state), key, env_state
+            )
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 
@@ -350,24 +354,22 @@ class AlphaZeroTrainer(AlphaZero):
     def save_checkpoint(self, state: TrainState, filename: str, directory: Path):
         self.train_checkpointer.save(directory / filename, state)
 
-
     def restore_checkpoint(self, filename: str, directory: Path):
         state = TrainState(
-            env_states=None, # type: ignore
-            params=None, # type: ignore
-            opt_state=None, # type: ignore
-            net_state=None, # type: ignore
-            avg_return=None, # type: ignore
-            avg_loss=None, # type: ignore
-            avg_pi_loss=None,# type: ignore
-            avg_value_loss=None, # type: ignore
-            episode_return=None, # type: ignore
-            num_episodes=None, # type: ignore
-            eval_avg_return=None, # type: ignore
-            eval_episode_return=None, # type: ignore
-            key=None, # type: ignore
-        ) # type: ignore
+            env_states=None,  # type: ignore
+            params=None,  # type: ignore
+            opt_state=None,  # type: ignore
+            net_state=None,  # type: ignore
+            avg_return=None,  # type: ignore
+            avg_loss=None,  # type: ignore
+            avg_pi_loss=None,  # type: ignore
+            avg_value_loss=None,  # type: ignore
+            episode_return=None,  # type: ignore
+            num_episodes=None,  # type: ignore
+            eval_avg_return=None,  # type: ignore
+            eval_episode_return=None,  # type: ignore
+            key=None,  # type: ignore
+        )  # type: ignore
 
         self.train_checkpointer.restore(directory / filename, state)
         return state
-

@@ -1,6 +1,6 @@
 import dataclasses
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import chex
 import haiku as hk
@@ -19,6 +19,11 @@ class Config:
     gumbel_scale: float
 
 
+class ModelState(NamedTuple):
+    params: hk.MutableParams
+    state: hk.MutableState
+
+
 class AlphaZero:
     def __init__(
         self,
@@ -34,12 +39,11 @@ class AlphaZero:
 
     def _recurrent_fn(
         self,
-        packed_params: tuple[hk.MutableParams, hk.MutableState],
+        model: ModelState,
         key: chex.PRNGKey,
         actions: chex.Array,
         env_states: chex.Array,
     ):
-        params, net_state = packed_params
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
         batch_rewards = jax.vmap(lambda x: x.reward, in_axes=(0,))
@@ -50,7 +54,7 @@ class AlphaZero:
         rewards = batch_rewards(steps)
         terminals = batch_terminals(steps)
 
-        (pi_logits, value), _ = self.network.apply(params, net_state, key, obs)
+        (pi_logits, value), _ = self.network.apply(model.params, model.state, key, obs)
 
         return (
             mctx.RecurrentFnOutput(
@@ -64,8 +68,7 @@ class AlphaZero:
 
     def _policy_output(
         self,
-        params: hk.MutableParams,
-        net_state: hk.MutableState,
+        model: ModelState,
         key: chex.PRNGKey,
         env_states: Any,
         pi_logits: chex.Array,
@@ -78,7 +81,7 @@ class AlphaZero:
         )
 
         return mctx.gumbel_muzero_policy(
-            params=(params, net_state),
+            params=model,
             rng_key=key,
             root=root,
             recurrent_fn=self._recurrent_fn,
@@ -95,19 +98,17 @@ class AlphaZero:
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
         self,
-        params: hk.MutableParams,
-        net_state: hk.MutableState,
+        model: ModelState,
         key: chex.PRNGKey,
         env_state: Any,
     ) -> int:
         key, subkey = jax.random.split(key)
         (pi_logits, value), _ = self.network.apply(
-            params, net_state, subkey, self.obs_fn(env_state)[None, ...]
+            model.params, model.state, subkey, self.obs_fn(env_state)[None, ...]
         )
 
         policy_output = self._policy_output(
-            params=params,
-            net_state=net_state,
+            model=model,
             key=key,
             env_states=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state),
             pi_logits=pi_logits,
