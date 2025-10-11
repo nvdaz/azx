@@ -26,8 +26,7 @@ class TrainConfig(Config):
     checkpoint_frequency: int
 
 
-@chex.dataclass
-class TrainState:
+class TrainState(NamedTuple):
     model: ModelState
     env_states: chex.Array
     opt_state: optax.OptState
@@ -130,7 +129,7 @@ class AlphaZeroTrainer(AlphaZero):
             )
         )(terminal, reset_states, env_states)
 
-        state = state.replace(key=key, env_states=env_states)  # type: ignore
+        state = state._replace(key=key, env_states=env_states)
 
         return state, reward, terminal
 
@@ -173,7 +172,7 @@ class AlphaZeroTrainer(AlphaZero):
             value=value,
         )
 
-        return state.replace(key=key), policy_output
+        return state._replace(key=key), policy_output
 
     def _compute_gradients(
         self,
@@ -196,9 +195,9 @@ class AlphaZeroTrainer(AlphaZero):
     ) -> TrainState:
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
-        return state.replace(
+        return state._replace(
             model=ModelState(params=params, state=net_state), opt_state=opt_state
-        )  # type: ignore
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
@@ -258,7 +257,7 @@ class AlphaZeroTrainer(AlphaZero):
             )
             next_num_episodes = state.num_episodes + terminals.astype(jnp.int32)
 
-            state = state.replace(  # type: ignore
+            state = state._replace(
                 key=key,
                 episode_return=next_episode_return,
                 avg_return=next_avg_return,
