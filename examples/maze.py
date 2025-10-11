@@ -29,17 +29,19 @@ config = TrainConfig(
 
 
 def make_network_fn(action_dim: int):
-    def net_fn(obs: jnp.ndarray):
-        chex.assert_shape(obs, (None, None))
-        x = hk.Linear(64)(obs)
-        x = jax.nn.relu(x)
-        x = hk.Linear(64)(x)
-        x = jax.nn.relu(x)
-        pi_logits = hk.Linear(action_dim)(x)
-        value = hk.Linear(1)(x)
-        return pi_logits, jnp.squeeze(value, -1)
+    def init():
+        def net_fn(obs: jnp.ndarray):
+            chex.assert_shape(obs, (None, None))
+            x = hk.Linear(64)(obs)
+            x = jax.nn.relu(x)
+            x = hk.Linear(64)(x)
+            x = jax.nn.relu(x)
+            pi_logits = hk.Linear(action_dim)(x)
+            value = hk.Linear(1)(x)
+            return pi_logits, jnp.squeeze(value, -1)
 
-    return net_fn
+        return net_fn
+    return init
 
 
 def flatten_observation(obs: State) -> jnp.ndarray:

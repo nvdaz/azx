@@ -24,12 +24,12 @@ class AlphaZero:
         self,
         env: Environment,
         config: Config,
-        network_fn: Callable[[jax.Array], hk.Module],
+        network_fn: Callable[[], Callable[[jax.Array], hk.Module]],
         obs_fn: Callable[[Any], chex.Array],
     ):
         self.env = env
         self.config = config
-        self.network = hk.transform_with_state(network_fn)
+        self.network = hk.transform_with_state(network_fn())
         self.obs_fn = obs_fn
 
     def _recurrent_fn(
