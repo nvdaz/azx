@@ -1,7 +1,7 @@
 import dataclasses
 import functools
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, NamedTuple
 
 import chex
 import haiku as hk
@@ -28,9 +28,8 @@ class TrainConfig(Config):
 
 @chex.dataclass
 class TrainState:
+    model: ModelState
     env_states: chex.Array
-    params: hk.MutableParams
-    net_state: hk.MutableState
     opt_state: optax.OptState
     avg_return: chex.Array
     avg_loss: chex.Array
@@ -73,10 +72,9 @@ class AlphaZeroTrainer(AlphaZero):
         env_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         return TrainState(
+            model=ModelState(params, net_state),
             env_states=env_states,
-            params=params,
             opt_state=opt_state,
-            net_state=net_state,
             avg_return=jnp.zeros(self.config.batch_size),
             avg_loss=jnp.zeros(self.config.batch_size),
             avg_pi_loss=jnp.zeros(self.config.batch_size),
@@ -144,8 +142,8 @@ class AlphaZeroTrainer(AlphaZero):
         env_obs = batch_obs(state.env_states)
 
         key, subkey = jax.random.split(state.key)
-        (pi_logits, value), net_state = self.network.apply(
-            state.params, state.net_state, subkey, env_obs
+        (pi_logits, value), _ = self.network.apply(
+            state.model.params, state.model.state, subkey, env_obs
         )
 
         key, subkey = jax.random.split(key)
@@ -168,14 +166,14 @@ class AlphaZeroTrainer(AlphaZero):
         noisy_logits = jnp.where(valid, jnp.log(noisy_priors), -1e10)
 
         policy_output = self._policy_output(
-            model=ModelState(state.params, state.net_state),
+            model=state.model,
             key=mcts_key,
             env_states=state.env_states,
             pi_logits=noisy_logits,
             value=value,
         )
 
-        return state.replace(key=key, net_state=net_state), policy_output  # type: ignore
+        return state.replace(key=key), policy_output
 
     def _compute_gradients(
         self,
@@ -184,17 +182,23 @@ class AlphaZeroTrainer(AlphaZero):
         search_policy: chex.Array,
         search_value: chex.Array,
         obs: chex.Array,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[
+        tuple[chex.Array, tuple[chex.Array, chex.Array, chex.Array]], chex.Array
+    ]:
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
         )(model.params, model.state, key, search_policy, search_value, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
-    def _apply_updates(self, state: TrainState, grads: chex.Array) -> TrainState:
-        updates, opt_state = self.opt.update(grads, state.opt_state, state.params)
-        params = optax.apply_updates(state.params, updates)
-        return state.replace(params=params, opt_state=opt_state)  # type: ignore
+    def _apply_updates(
+        self, state: TrainState, grads: chex.Array, net_state: hk.MutableState
+    ) -> TrainState:
+        updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
+        params = optax.apply_updates(state.model.params, updates)
+        return state.replace(
+            model=ModelState(params=params, state=net_state), opt_state=opt_state
+        )  # type: ignore
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
@@ -226,13 +230,13 @@ class AlphaZeroTrainer(AlphaZero):
             key, subkey = jax.random.split(state.key)
 
             (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                ModelState(state.params, state.net_state),
+                state.model,
                 subkey,
                 pi_target,
                 v_target,
                 env_obs,
             )
-            state = self._apply_updates(state, grads)
+            state = self._apply_updates(state, grads, net_state)
             state, reward, terminals = self._step_env(state, policy_output.action)
 
             new_return = state.episode_return + reward
@@ -255,7 +259,6 @@ class AlphaZeroTrainer(AlphaZero):
             next_num_episodes = state.num_episodes + terminals.astype(jnp.int32)
 
             state = state.replace(  # type: ignore
-                net_state=net_state,
                 key=key,
                 episode_return=next_episode_return,
                 avg_return=next_avg_return,
@@ -275,9 +278,7 @@ class AlphaZeroTrainer(AlphaZero):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
         def single_action(env_state, key):
-            return self.predict(
-                ModelState(state.params, state.net_state), key, env_state
-            )
+            return self.predict(state.model, key, env_state)
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 
