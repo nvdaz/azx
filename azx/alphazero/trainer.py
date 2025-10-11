@@ -48,7 +48,7 @@ class AlphaZeroTrainer(AlphaZero):
         self,
         env: Environment,
         config: TrainConfig,
-        network_fn: Callable[[jax.Array], hk.Module],
+        network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
         obs_fn: Callable[[Any], chex.Array],
         action_mask_fn: Callable[[Any], chex.Array],
         opt: optax.GradientTransformation,
@@ -192,10 +192,7 @@ class AlphaZeroTrainer(AlphaZero):
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
-    def _apply_updates(self, state: TrainState, ac_grads: chex.Array) -> TrainState:
-        grad_norm = jax.tree.reduce(lambda a, x: a + jnp.sum(x**2), ac_grads, 0.0)
-        clip = jnp.minimum(1.0, 1.0 / (jnp.sqrt(grad_norm) + 1e-6))
-        grads = jax.tree.map(lambda g: g * clip, ac_grads)
+    def _apply_updates(self, state: TrainState, grads: chex.Array) -> TrainState:
         updates, opt_state = self.opt.update(grads, state.opt_state, state.params)
         params = optax.apply_updates(state.params, updates)
         return state.replace(params=params, opt_state=opt_state)  # type: ignore
@@ -212,14 +209,18 @@ class AlphaZeroTrainer(AlphaZero):
             count_sums = jnp.maximum(count_sums, 1.0)
             pi_target = raw_counts / count_sums
 
-            # Compute visit-weighted average Q at the root for value target:
-            ROOT = policy_output.search_tree.ROOT_INDEX
-            root_indices = jnp.full((self.config.batch_size,), ROOT)
-            actions = policy_output.action  # shape [batch]
-            qvalues = policy_output.search_tree.qvalues(
-                root_indices
-            )  # shape [batch, num_actions]
-            v_target = qvalues[jnp.arange(self.config.batch_size), actions]
+            if self.config.value_target == "maxq":
+                ROOT = policy_output.search_tree.ROOT_INDEX
+                root_indices = jnp.full((self.config.batch_size,), ROOT)
+                qvalues = policy_output.search_tree.qvalues(root_indices)
+                v_target = qvalues[
+                    jnp.arange(self.config.batch_size), policy_output.action
+                ]
+            elif self.config.value_target == "nodev":
+                ROOT = policy_output.search_tree.ROOT_INDEX
+                v_target = policy_output.search_tree.node_values[:, ROOT]
+            else:
+                raise ValueError("Unknown value target.")
 
             env_obs = batch_obs(state.env_states)
 
@@ -309,7 +310,8 @@ class AlphaZeroTrainer(AlphaZero):
     def learn(
         self, state: TrainState, num_steps: int, checkpoints_dir: str
     ) -> tuple[TrainState, list[float], list[int]]:
-        path = ocp.test_utils.erase_and_create_empty(Path(checkpoints_dir).resolve())
+        path = Path(checkpoints_dir).resolve()
+        path.mkdir(parents=True, exist_ok=True)
         checkpointer = ocp.StandardCheckpointer()
         returns = []
         steps = []

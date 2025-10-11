@@ -27,12 +27,18 @@ config = TrainConfig(
     gumbel_scale=0.5,
 )
 
+ACTIVATIONS = {
+    "relu": jax.nn.relu,
+}
+
 
 def make_network_fn(action_dim: int):
     def init():
         def net_fn(obs: jnp.ndarray):
             chex.assert_shape(obs, (None, None))
+            # dense layer
             x = hk.Linear(64)(obs)
+            # apply activation function
             x = jax.nn.relu(x)
             x = hk.Linear(64)(x)
             x = jax.nn.relu(x)
@@ -41,12 +47,26 @@ def make_network_fn(action_dim: int):
             return pi_logits, jnp.squeeze(value, -1)
 
         return net_fn
+
     return init
 
 
+class MLPBackbone(hk.Module):
+    def __init__(self, num_actions: int, name=None):
+        super().__init__(name=name)
+        self.num_actions = num_actions
+
+    def __call__(self, x):
+        x = x.astype(jnp.float32)
+        x = hk.nets.MLP([128, 128])(x)  # [B, F] -> [B, 128]
+        pi_logits = hk.Linear(self.num_actions)(x)  # [B, A]
+        value = hk.Linear(1)(x)  # [B, 1]
+        value = jnp.squeeze(value, -1)  # [B]
+        return pi_logits, value
+
+
 def flatten_observation(obs: State) -> jnp.ndarray:
-    # Derive maze dimensions from the walls array
-    rows, cols = obs.walls.shape  # each is an integer
+    rows, cols = obs.walls.shape
 
     # Normalize agent position and target position to [0,1]
     agent_pos = jnp.array(obs.agent_position, dtype=jnp.float32) / jnp.array(
@@ -73,10 +93,10 @@ def action_mask_fn(state):
 trainer = AlphaZeroTrainer(
     env=env,
     config=config,
-    network_fn=make_network_fn(action_dim),
+    network_fn=lambda obs: MLPBackbone(action_dim)(obs),
     action_mask_fn=action_mask_fn,
     obs_fn=flatten_observation,
-    opt=optax.adamw(3e-4),
+    opt=optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4)),
 )
 
 key = jax.random.PRNGKey(0)
