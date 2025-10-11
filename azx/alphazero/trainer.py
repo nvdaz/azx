@@ -57,6 +57,7 @@ class AlphaZeroTrainer(AlphaZero):
         self.opt = opt
         self.config = config
         self.action_mask_fn = action_mask_fn
+        self.train_checkpointer = ocp.StandardCheckpointer()
 
     def init(self, key: chex.PRNGKey) -> TrainState:
         key, subkey = jax.random.split(key)
@@ -312,7 +313,6 @@ class AlphaZeroTrainer(AlphaZero):
     ) -> tuple[TrainState, list[float], list[int]]:
         path = Path(checkpoints_dir).resolve()
         path.mkdir(parents=True, exist_ok=True)
-        checkpointer = ocp.StandardCheckpointer()
         returns = []
         steps = []
         time_step = 0
@@ -338,11 +338,36 @@ class AlphaZeroTrainer(AlphaZero):
             )
 
             if time_step % self.config.checkpoint_frequency == 0:
-                checkpointer.save(path / f"checkpoint-{time_step}", state)
+                self.save_checkpoint(state, f"checkpoint-{time_step}", path)
 
-        checkpointer.save(path / "checkpoint-final", state)
+        self.save_checkpoint(state, "checkpoint-final", path)
 
         print("Saving final checkpoint...", flush=True)
-        checkpointer.wait_until_finished()
+        self.train_checkpointer.wait_until_finished()
 
         return state, returns, steps
+
+    def save_checkpoint(self, state: TrainState, filename: str, directory: Path):
+        self.train_checkpointer.save(directory / filename, state)
+
+
+    def restore_checkpoint(self, filename: str, directory: Path):
+        state = TrainState(
+            env_states=None, # type: ignore
+            params=None, # type: ignore
+            opt_state=None, # type: ignore
+            net_state=None, # type: ignore
+            avg_return=None, # type: ignore
+            avg_loss=None, # type: ignore
+            avg_pi_loss=None,# type: ignore
+            avg_value_loss=None, # type: ignore
+            episode_return=None, # type: ignore
+            num_episodes=None, # type: ignore
+            eval_avg_return=None, # type: ignore
+            eval_episode_return=None, # type: ignore
+            key=None, # type: ignore
+        ) # type: ignore
+
+        self.train_checkpointer.restore(directory / filename, state)
+        return state
+
