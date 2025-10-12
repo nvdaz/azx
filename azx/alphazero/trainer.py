@@ -1,7 +1,7 @@
 import dataclasses
 import functools
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, NamedTuple
 
 import chex
 import haiku as hk
@@ -12,13 +12,14 @@ import optax
 import orbax.checkpoint as ocp
 from jumanji.env import Environment
 
-from .agent import AlphaZero, Config
+from .agent import AlphaZero, Config, ModelState
 
 
 @dataclasses.dataclass
 class TrainConfig(Config):
     batch_size: int
     eval_frequency: int
+    max_eval_steps: int
     avg_return_smoothing: float
     value_target: Literal["maxq", "nodev"]
     dirichlet_alpha: float
@@ -26,11 +27,9 @@ class TrainConfig(Config):
     checkpoint_frequency: int
 
 
-@chex.dataclass
-class TrainState:
+class TrainState(NamedTuple):
+    model: ModelState
     env_states: chex.Array
-    params: hk.MutableParams
-    net_state: hk.MutableState
     opt_state: optax.OptState
     avg_return: chex.Array
     avg_loss: chex.Array
@@ -57,6 +56,7 @@ class AlphaZeroTrainer(AlphaZero):
         self.opt = opt
         self.config = config
         self.action_mask_fn = action_mask_fn
+        self.train_checkpointer = ocp.StandardCheckpointer()
 
     def init(self, key: chex.PRNGKey) -> TrainState:
         key, subkey = jax.random.split(key)
@@ -72,10 +72,9 @@ class AlphaZeroTrainer(AlphaZero):
         env_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         return TrainState(
+            model=ModelState(params, net_state),
             env_states=env_states,
-            params=params,
             opt_state=opt_state,
-            net_state=net_state,
             avg_return=jnp.zeros(self.config.batch_size),
             avg_loss=jnp.zeros(self.config.batch_size),
             avg_pi_loss=jnp.zeros(self.config.batch_size),
@@ -131,7 +130,7 @@ class AlphaZeroTrainer(AlphaZero):
             )
         )(terminal, reset_states, env_states)
 
-        state = state.replace(key=key, env_states=env_states)  # type: ignore
+        state = state._replace(key=key, env_states=env_states)
 
         return state, reward, terminal
 
@@ -143,8 +142,8 @@ class AlphaZeroTrainer(AlphaZero):
         env_obs = batch_obs(state.env_states)
 
         key, subkey = jax.random.split(state.key)
-        (pi_logits, value), net_state = self.network.apply(
-            state.params, state.net_state, subkey, env_obs
+        (pi_logits, value), _ = self.network.apply(
+            state.model.params, state.model.state, subkey, env_obs
         )
 
         key, subkey = jax.random.split(key)
@@ -167,35 +166,39 @@ class AlphaZeroTrainer(AlphaZero):
         noisy_logits = jnp.where(valid, jnp.log(noisy_priors), -1e10)
 
         policy_output = self._policy_output(
-            params=state.params,
-            net_state=state.net_state,
+            model=state.model,
             key=mcts_key,
             env_states=state.env_states,
             pi_logits=noisy_logits,
             value=value,
         )
 
-        return state.replace(key=key, net_state=net_state), policy_output  # type: ignore
+        return state._replace(key=key), policy_output
 
     def _compute_gradients(
         self,
-        params: hk.MutableParams,
-        net_state: hk.MutableState,
+        model: ModelState,
         key: chex.Array,
         search_policy: chex.Array,
         search_value: chex.Array,
         obs: chex.Array,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[
+        tuple[chex.Array, tuple[chex.Array, chex.Array, chex.Array]], chex.Array
+    ]:
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(params, net_state, key, search_policy, search_value, obs)
+        )(model.params, model.state, key, search_policy, search_value, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
-    def _apply_updates(self, state: TrainState, grads: chex.Array) -> TrainState:
-        updates, opt_state = self.opt.update(grads, state.opt_state, state.params)
-        params = optax.apply_updates(state.params, updates)
-        return state.replace(params=params, opt_state=opt_state)  # type: ignore
+    def _apply_updates(
+        self, state: TrainState, grads: chex.Array, net_state: hk.MutableState
+    ) -> TrainState:
+        updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
+        params = optax.apply_updates(state.model.params, updates)
+        return state._replace(
+            model=ModelState(params=params, state=net_state), opt_state=opt_state
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
@@ -227,9 +230,13 @@ class AlphaZeroTrainer(AlphaZero):
             key, subkey = jax.random.split(state.key)
 
             (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                state.params, state.net_state, subkey, pi_target, v_target, env_obs
+                state.model,
+                subkey,
+                pi_target,
+                v_target,
+                env_obs,
             )
-            state = self._apply_updates(state, grads)
+            state = self._apply_updates(state, grads, net_state)
             state, reward, terminals = self._step_env(state, policy_output.action)
 
             new_return = state.episode_return + reward
@@ -251,8 +258,7 @@ class AlphaZeroTrainer(AlphaZero):
             )
             next_num_episodes = state.num_episodes + terminals.astype(jnp.int32)
 
-            state = state.replace(  # type: ignore
-                net_state=net_state,
+            state = state._replace(
                 key=key,
                 episode_return=next_episode_return,
                 avg_return=next_avg_return,
@@ -272,12 +278,12 @@ class AlphaZeroTrainer(AlphaZero):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
         def single_action(env_state, key):
-            return self.predict(state.params, state.net_state, key, env_state)
+            return self.predict(state.model, key, env_state)
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 
-        def loop_fn(_, carry):
-            env_states, reward_acc, done_mask, key = carry
+        def loop_fn(carry):
+            env_states, reward_acc, done_mask, key, iter = carry
             key, subkey = jax.random.split(key)
             step_keys = jax.random.split(subkey, self.config.batch_size)
 
@@ -292,7 +298,7 @@ class AlphaZeroTrainer(AlphaZero):
             reward_acc = jnp.where(done_mask, reward_acc, reward_acc + r)
             done_mask = jnp.logical_or(done_mask, done)
 
-            return next_states, reward_acc, done_mask, key
+            return next_states, reward_acc, done_mask, key, iter + 1
 
         key, subkey = jax.random.split(state.key)
         reset_keys = jax.random.split(subkey, self.config.batch_size)
@@ -301,8 +307,11 @@ class AlphaZeroTrainer(AlphaZero):
         reward_acc = jnp.zeros(self.config.batch_size)
         done_mask = jnp.zeros(self.config.batch_size, dtype=jnp.bool_)
 
-        _, reward_acc, _, _ = jax.lax.fori_loop(
-            0, max_steps, loop_fn, (env_states, reward_acc, done_mask, key)
+        _, reward_acc, _, _, _ = jax.lax.while_loop(
+            lambda carry: jnp.any(~carry[2])
+            & (carry[4] < max_steps),  # while any not done and iters under max steps
+            loop_fn,
+            (env_states, reward_acc, done_mask, key, 0),
         )
 
         return jnp.mean(reward_acc)
@@ -312,7 +321,6 @@ class AlphaZeroTrainer(AlphaZero):
     ) -> tuple[TrainState, list[float], list[int]]:
         path = Path(checkpoints_dir).resolve()
         path.mkdir(parents=True, exist_ok=True)
-        checkpointer = ocp.StandardCheckpointer()
         returns = []
         steps = []
         time_step = 0
@@ -321,7 +329,6 @@ class AlphaZeroTrainer(AlphaZero):
             state = self.train_step(state)
 
             valid_returns = state.avg_return[state.num_episodes > 0]
-            valid_episodes = state.num_episodes[state.num_episodes > 0]
             avg_return = jnp.mean(valid_returns) if valid_returns.size > 0 else 0.0
             avg_pi_loss = jnp.mean(state.avg_pi_loss)
             avg_value_loss = jnp.mean(state.avg_value_loss)
@@ -329,7 +336,7 @@ class AlphaZeroTrainer(AlphaZero):
             returns.append(avg_return)
             time_step += self.config.eval_frequency
             steps.append(time_step)
-            ev = self.evaluate(state, 100)
+            ev = self.evaluate(state, self.config.max_eval_steps)
 
             print(
                 f"Step {time_step} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
@@ -338,11 +345,33 @@ class AlphaZeroTrainer(AlphaZero):
             )
 
             if time_step % self.config.checkpoint_frequency == 0:
-                checkpointer.save(path / f"checkpoint-{time_step}", state)
+                self.save_checkpoint(state, f"checkpoint-{time_step}", path)
 
-        checkpointer.save(path / "checkpoint-final", state)
+        self.save_checkpoint(state, "checkpoint-final", path)
 
         print("Saving final checkpoint...", flush=True)
-        checkpointer.wait_until_finished()
+        self.train_checkpointer.wait_until_finished()
 
         return state, returns, steps
+
+    def save_checkpoint(self, state: TrainState, filename: str, directory: Path):
+        self.train_checkpointer.save(directory / filename, state)
+
+    def restore_checkpoint(self, filename: str, directory: Path):
+        state = TrainState(
+            env_states=None,  # type: ignore
+            model=ModelState(params=None, state=None),  #  type: ignore
+            opt_state=None,  # type: ignore
+            avg_return=None,  # type: ignore
+            avg_loss=None,  # type: ignore
+            avg_pi_loss=None,  # type: ignore
+            avg_value_loss=None,  # type: ignore
+            episode_return=None,  # type: ignore
+            num_episodes=None,  # type: ignore
+            eval_avg_return=None,  # type: ignore
+            eval_episode_return=None,  # type: ignore
+            key=None,  # type: ignore
+        )  # type: ignore
+
+        self.train_checkpointer.restore(directory / filename, state)
+        return state
