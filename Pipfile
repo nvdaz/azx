@@ -9,6 +9,8 @@ orbax = "*"
 dm-haiku = "*"
 optax = "*"
 jumanji = "*"
+flashbax = "*"
+rlax = "*"
 
 [dev-packages]
 ruff = {version = "*", extras = ["format"]}

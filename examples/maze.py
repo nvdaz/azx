@@ -16,43 +16,23 @@ config = TrainConfig(
     discount=0.99,
     use_mixed_value=True,
     value_scale=1.0,
-    value_target="maxq",
     batch_size=32,
+    n_step=8,
+    unroll_steps=4,
     avg_return_smoothing=0.99,
     num_simulations=50,
-    eval_frequency=10000,
+    eval_frequency=1000,
     max_eval_steps=1000,
     dirichlet_alpha=0.3,
     dirichlet_mix=0,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
+    max_length_buffer=64,
+    min_length_buffer=8,
 )
 
-ACTIVATIONS = {
-    "relu": jax.nn.relu,
-}
 
-
-def make_network_fn(action_dim: int):
-    def init():
-        def net_fn(obs: jnp.ndarray):
-            chex.assert_shape(obs, (None, None))
-            # dense layer
-            x = hk.Linear(64)(obs)
-            # apply activation function
-            x = jax.nn.relu(x)
-            x = hk.Linear(64)(x)
-            x = jax.nn.relu(x)
-            pi_logits = hk.Linear(action_dim)(x)
-            value = hk.Linear(1)(x)
-            return pi_logits, jnp.squeeze(value, -1)
-
-        return net_fn
-
-    return init
-
-
-class MLPBackbone(hk.Module):
+class MLP(hk.Module):
     def __init__(self, num_actions: int, name=None):
         super().__init__(name=name)
         self.num_actions = num_actions
@@ -62,7 +42,7 @@ class MLPBackbone(hk.Module):
         x = hk.nets.MLP([128, 128])(x)  # [B, F] -> [B, 128]
         pi_logits = hk.Linear(self.num_actions)(x)  # [B, A]
         value = hk.Linear(1)(x)  # [B, 1]
-        value = jnp.squeeze(value, -1)  # [B]
+        value = value[..., 0]  # [B]
         return pi_logits, value
 
 
@@ -94,7 +74,7 @@ def action_mask_fn(state):
 trainer = AlphaZeroTrainer(
     env=env,
     config=config,
-    network_fn=lambda obs: MLPBackbone(action_dim)(obs),
+    network_fn=lambda obs: MLP(action_dim)(obs),
     action_mask_fn=action_mask_fn,
     obs_fn=flatten_observation,
     opt=optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4)),

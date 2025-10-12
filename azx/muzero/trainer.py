@@ -1,7 +1,7 @@
 import dataclasses
 import functools
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple
+from typing import Callable, NamedTuple
 
 import chex
 import haiku as hk
@@ -20,8 +20,8 @@ class TrainConfig(Config):
     batch_size: int
     eval_frequency: int
     max_eval_steps: int
+    value_target: str
     avg_return_smoothing: float
-    value_target: Literal["maxq", "nodev"]
     dirichlet_alpha: float
     dirichlet_mix: float
     checkpoint_frequency: int
@@ -130,10 +130,8 @@ class MuZeroTrainer(MuZero):
 
         pi_loss = optax.softmax_cross_entropy(pi_logits, pi_target).mean()
         value_loss = optax.l2_loss(value, value_target).mean()
-        reward_loss = optax.l2_loss(rewards, reward_target).mean()
-        terminal_loss = optax.l2_loss(terminals, terminal_target).mean()
 
-        return pi_loss + value_loss + reward_loss + terminal_loss, (
+        return pi_loss + value_loss, (
             ModelNetState(rep=rep_state, dyn=dyn_state, pred=pred_state),
             jax.lax.stop_gradient(pi_loss),
             jax.lax.stop_gradient(value_loss),
@@ -221,7 +219,9 @@ class MuZeroTrainer(MuZero):
         actions: chex.Array,
         reward_targets: chex.Array,
         terminal_targets: chex.Array,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[
+        tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]], chex.Array
+    ]:
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
         )(
@@ -239,7 +239,7 @@ class MuZeroTrainer(MuZero):
         return (loss, (net_state, pi_loss, value_loss)), grads
 
     def _apply_updates(
-        self, state: TrainState, grads: optax.Updates, net_state: hk.MutableState
+        self, state: TrainState, grads: optax.Updates, net_state: ModelNetState
     ) -> TrainState:
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
