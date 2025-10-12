@@ -1,150 +1,118 @@
 import pathlib
 
-import chex
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import optax
 from jumanji.environments.routing.maze.env import Maze
-from jumanji.environments.routing.maze.generator import Generator, RandomGenerator
-from jumanji.environments.routing.maze.types import Position, State
+from jumanji.environments.routing.maze.generator import RandomGenerator
+from jumanji.environments.routing.maze.types import State
 
 from azx.muzero.trainer import MuZeroTrainer, TrainConfig
 
+config = TrainConfig(
+    discount=0.99,
+    use_mixed_value=True,
+    value_scale=1.0,
+    value_target="maxq",
+    batch_size=32,
+    avg_return_smoothing=0.99,
+    num_simulations=50,
+    eval_frequency=10000,
+    max_eval_steps=1000,
+    dirichlet_alpha=0.3,
+    dirichlet_mix=0,
+    checkpoint_frequency=100000,
+    gumbel_scale=0.5,
+)
+
 
 def flatten_observation(obs: State) -> jnp.ndarray:
-    agent_pos = jnp.array(obs.agent_position)
-    target_pos = jnp.array(obs.target_position)
+    rows, cols = obs.walls.shape
 
-    walls_flat = jnp.ravel(obs.walls)
-    action_mask = obs.action_mask
-    step = jnp.array([obs.step_count])
+    # Normalize agent position and target position to [0,1]
+    agent_pos = jnp.array(obs.agent_position, dtype=jnp.float32) / jnp.array(
+        [rows - 1, cols - 1], dtype=jnp.float32
+    )
+    target_pos = jnp.array(obs.target_position, dtype=jnp.float32) / jnp.array(
+        [rows - 1, cols - 1], dtype=jnp.float32
+    )
 
-    return jnp.concatenate(
-        [agent_pos, target_pos, walls_flat, action_mask, step]
-    ).astype(jnp.float32)
+    walls_flat = jnp.ravel(obs.walls).astype(jnp.float32)
+    action_mask = jnp.array(obs.action_mask, dtype=jnp.float32)
 
-
-def make_representation_fn(latent_dim: int):
-    def representation_fn(obs: jnp.ndarray) -> jnp.ndarray:
-        x = obs
-        for _ in range(3):
-            x = hk.Linear(128)(x)
-            x = jax.nn.relu(x)
-        return hk.Linear(latent_dim)(x)
-
-    return representation_fn
+    return jnp.concatenate([agent_pos, target_pos, walls_flat, action_mask])
 
 
-def make_dynamics_fn(latent_dim: int, action_dim: int):
-    def dynamics_fn(
-        latent: jnp.ndarray, action: jnp.ndarray
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        a_oh = jax.nn.one_hot(action, action_dim)[0]
-        x = jnp.concatenate([latent, a_oh], axis=-1)
-        for _ in range(3):
-            x = hk.Linear(32)(x)
-            x = jax.nn.relu(x)
-        next_latent = hk.Linear(latent_dim)(x)
-        reward = jnp.squeeze(hk.Linear(1)(x), -1)
-        terminal = jnp.squeeze(hk.Linear(1)(x), -1)
+class RepresentationModel(hk.Module):
+    def __init__(self, latent_dim: int, name=None):
+        super().__init__(name=name)
+        self.latent_dim = latent_dim
+
+    def __call__(self, x):
+        x = x.astype(jnp.float32)  # (B, F)
+        x = hk.nets.MLP([128, 128])(x)  # (B, 128)
+        return hk.Linear(latent_dim)(x)  # (B, L)
+
+
+class DynamicsModel(hk.Module):
+    def __init__(self, latent_dim: int, action_dim: int, name=None):
+        super().__init__(name=name)
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+
+    def __call__(self, latent, action):
+        latent = latent.astype(jnp.float32)
+        action = action.astype(jnp.int32)
+        action_oh = jax.nn.one_hot(action, self.action_dim)
+        x = jnp.concatenate([latent, action_oh], axis=-1)  # (B, L + A)
+        x = hk.nets.MLP([128, 128])(x)  # (B, 128)
+
+        next_latent = hk.Linear(self.latent_dim)(x)  # (B, L)
+        reward = jnp.squeeze(hk.Linear(1)(x), -1)  # (B,)
+        terminal = jnp.squeeze(hk.Linear(1)(x), -1)  # (B,)
+
         return next_latent, reward, terminal
 
-    return dynamics_fn
 
+class PredictionModel(hk.Module):
+    def __init__(self, action_dim: int, name=None):
+        super().__init__(name=name)
+        self.action_dim = action_dim
 
-def make_prediction_fn(action_dim: int):
-    def prediction_fn(latent: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = latent
-        for _ in range(3):
-            x = hk.Linear(32)(x)
-            x = jax.nn.relu(x)
-        pi_logits = hk.Linear(action_dim)(x)
-        value = jnp.squeeze(hk.Linear(1)(x), -1)
+    def __call__(self, x):
+        x = hk.nets.MLP([128, 128])(x)  # (B, 128)
+        pi_logits = hk.Linear(self.action_dim)(x)  # (B, A)
+        value = jnp.squeeze(hk.Linear(1)(x), -1)  # (B)
         return pi_logits, value
 
-    return prediction_fn
+env = Maze(RandomGenerator(5, 5))
+action_dim = env.action_spec.num_values
+latent_dim = 64
+
+def action_mask_fn(state):
+    return state.action_mask
+
+trainer = MuZeroTrainer(
+    env=env,
+    config=config,
+    representation_fn=lambda x: RepresentationModel(latent_dim)(x),
+    dynamics_fn=lambda x1, x2: DynamicsModel(latent_dim, action_dim)(x1, x2),
+    prediction_fn=lambda x: PredictionModel(action_dim)(x),
+    obs_fn=flatten_observation,
+    action_mask_fn=action_mask_fn,
+    opt=optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4)),
+)
 
 
-class ToyGenerator(Generator):
-    """Generate a hardcoded 5x5 toy maze."""
+key = jax.random.PRNGKey(0)
+state = trainer.init(key)
 
-    def __init__(self) -> None:
-        super(ToyGenerator, self).__init__(num_rows=5, num_cols=5)
+checkpoints_dir = pathlib.Path("./checkpoints")
+checkpoints_dir.mkdir(exist_ok=True)
 
-    def __call__(self, key: chex.PRNGKey) -> State:
-        walls = jnp.ones((self.num_rows, self.num_cols), bool)
-        walls = walls.at[0, :].set((False, True, True, False, False))
-        walls = walls.at[1, :].set((False, True, True, True, True))
-        walls = walls.at[2, :].set((False, True, False, False, False))
-        walls = walls.at[3, :].set((False, True, True, True, True))
-        walls = walls.at[4, :].set((False, False, False, False, False))
-
-        agent_position = Position(row=0, col=0)
-        target_position = Position(row=4, col=1)
-
-        # Build the state.
-        return State(
-            agent_position=agent_position,
-            target_position=target_position,
-            walls=walls,
-            action_mask=None,  # Action mask will be computed by the environment.
-            key=key,
-            step_count=jnp.array(0, jnp.int32),
-        )
-
-
-if __name__ == "__main__":
-    # --- environment setup ---
-    # env = Maze(RandomGenerator(5, 5))
-    env = Maze(ToyGenerator())
-    action_dim = env.action_spec.num_values
-
-    # --- config ---
-    key = jax.random.PRNGKey(0)
-    config = TrainConfig(
-        discount=0.99,
-        num_simulations=20,
-        use_mixed_value=False,
-        value_scale=1.0,
-        batch_size=32,
-        eval_frequency=100,
-        avg_return_smoothing=0.99,
-        dirichlet_alpha=0.3,
-        dirichlet_mix=0.25,
-        checkpoint_frequency=100,
-        gumbel_scale=0.0,
-        value_target="maxq",
-    )
-
-    latent_dim = 64
-
-    rep_fn = make_representation_fn(latent_dim)
-    dyn_fn = make_dynamics_fn(latent_dim, action_dim)
-    pred_fn = make_prediction_fn(action_dim)
-
-    # --- trainer init ---
-    trainer = MuZeroTrainer(
-        env=env,
-        config=config,
-        representation_fn=rep_fn,
-        dynamics_fn=dyn_fn,
-        prediction_fn=pred_fn,
-        obs_fn=flatten_observation,
-        opt=optax.adamw(1e-3),
-    )
-
-    state = trainer.init(key)
-
-    # --- run learning ---
-    checkpoints_dir = pathlib.Path("./muzero_checkpoints")
-    checkpoints_dir.mkdir(exist_ok=True)
-
-    # with jax.disable_jit():
-    final_state = trainer.learn(
-        state=state,
-        num_steps=100_000,
-        checkpoints_dir=str(checkpoints_dir),
-    )
-
-    print("MuZero training complete!")
+state, returns, steps = trainer.learn(
+    state=state,
+    num_steps=100000,
+    checkpoints_dir="./checkpoints",
+)

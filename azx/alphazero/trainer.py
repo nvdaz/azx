@@ -329,7 +329,6 @@ class AlphaZeroTrainer(AlphaZero):
             state = self.train_step(state)
 
             valid_returns = state.avg_return[state.num_episodes > 0]
-            valid_episodes = state.num_episodes[state.num_episodes > 0]
             avg_return = jnp.mean(valid_returns) if valid_returns.size > 0 else 0.0
             avg_pi_loss = jnp.mean(state.avg_pi_loss)
             avg_value_loss = jnp.mean(state.avg_value_loss)
@@ -361,9 +360,8 @@ class AlphaZeroTrainer(AlphaZero):
     def restore_checkpoint(self, filename: str, directory: Path):
         state = TrainState(
             env_states=None,  # type: ignore
-            params=None,  # type: ignore
+            model=ModelState(params=None, state=None),  #  type: ignore
             opt_state=None,  # type: ignore
-            net_state=None,  # type: ignore
             avg_return=None,  # type: ignore
             avg_loss=None,  # type: ignore
             avg_pi_loss=None,  # type: ignore

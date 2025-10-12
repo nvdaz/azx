@@ -1,6 +1,6 @@
 import dataclasses
 import functools
-from typing import Any, Callable, NamedTuple
+from typing import Callable, NamedTuple
 
 import chex
 import haiku as hk
@@ -30,7 +30,7 @@ class AlphaZero:
         env: Environment,
         config: Config,
         network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[Any], chex.Array],
+        obs_fn: Callable[[chex.ArrayTree], chex.Array],
     ):
         self.env = env
         self.config = config
@@ -70,7 +70,7 @@ class AlphaZero:
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        env_states: Any,
+        env_states: chex.ArrayTree,
         pi_logits: chex.Array,
         value: chex.Array,
     ) -> mctx.PolicyOutput:
@@ -100,12 +100,12 @@ class AlphaZero:
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        env_state: Any,
-    ) -> int:
+        env_state: chex.ArrayTree,
+    ) -> chex.Array:
         key, subkey = jax.random.split(key)
         (pi_logits, value), _ = self.network.apply(
             model.params, model.state, subkey, self.obs_fn(env_state)[None, ...]
-        )
+        )  # ignore new state for inference
 
         policy_output = self._policy_output(
             model=model,

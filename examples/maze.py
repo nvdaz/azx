@@ -19,12 +19,12 @@ config = TrainConfig(
     value_target="maxq",
     batch_size=32,
     avg_return_smoothing=0.99,
-    num_simulations=5,
-    eval_frequency=200,
+    num_simulations=50,
+    eval_frequency=10000,
     max_eval_steps=1000,
     dirichlet_alpha=0.3,
     dirichlet_mix=0,
-    checkpoint_frequency=1000,
+    checkpoint_frequency=100000,
     gumbel_scale=0.5,
 )
 

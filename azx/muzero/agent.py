@@ -1,13 +1,12 @@
 import dataclasses
 import functools
-from typing import Any, Callable
+from typing import Callable, NamedTuple
 
 import chex
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import mctx
-import optax
 
 
 @dataclasses.dataclass
@@ -19,42 +18,55 @@ class Config:
     gumbel_scale: float
 
 
-@chex.dataclass
-class Params:
-    representation: optax.Params
-    dynamics: optax.Params
-    prediction: optax.Params
+class ModelParams(NamedTuple):
+    rep: hk.MutableParams
+    dyn: hk.MutableParams
+    pred: hk.MutableParams
+
+
+class ModelNetState(NamedTuple):
+    rep: hk.MutableState
+    dyn: hk.MutableState
+    pred: hk.MutableState
+
+
+class ModelState(NamedTuple):
+    params: ModelParams
+    state: ModelNetState
 
 
 class MuZero:
     def __init__(
         self,
         config: Config,
-        representation_fn: Callable[[jax.Array], hk.Module],
-        dynamics_fn: Callable[[jax.Array], hk.Module],
-        prediction_fn: Callable[[jax.Array], hk.Module],
+        representation_fn: Callable[[chex.Array], chex.Array],
+        dynamics_fn: Callable[[chex.Array, chex.Array], chex.Array],
+        prediction_fn: Callable[[chex.Array], tuple[chex.Array, chex.Array]],
     ):
         self.config = config
-        self.rep_net = hk.without_apply_rng(hk.transform(representation_fn))
-        self.dyn_net = hk.without_apply_rng(hk.transform(dynamics_fn))
-        self.pred_net = hk.without_apply_rng(hk.transform(prediction_fn))
+        self.rep_net = hk.transform_with_state(representation_fn)
+        self.dyn_net = hk.transform_with_state(dynamics_fn)
+        self.pred_net = hk.transform_with_state(prediction_fn)
 
     def _recurrent_fn(
-        self, params: Params, _: chex.PRNGKey, actions: chex.Array, latents: chex.Array
+        self,
+        model: ModelState,
+        key: chex.PRNGKey,
+        actions: chex.Array,
+        latent_states: chex.Array,
     ):
-        next_latent, rewards, terminals = jax.vmap(
-            self.dyn_net.apply, in_axes=(None, 0, 0)
-        )(params.dynamics, latents, jnp.expand_dims(actions, axis=-1))
-        rewards = -jnp.ones_like(rewards)
-
-        pi_logits, value = jax.vmap(self.pred_net.apply, in_axes=(None, 0))(
-            params.prediction, next_latent
+        key, subkey = jax.random.split(key)
+        (next_latent, reward, terminal), _ = self.dyn_net.apply(
+            model.params.dyn, model.state.dyn, subkey, latent_states, actions
+        )
+        (pi_logits, value), _ = self.pred_net.apply(
+            model.params.pred, model.state.pred, key, next_latent
         )
 
         return (
             mctx.RecurrentFnOutput(
-                reward=rewards,  # type: ignore
-                discount=jnp.where(terminals, 0.0, self.config.discount),  # type: ignore
+                reward=reward,  # type: ignore
+                discount=jnp.where(terminal, 0.0, self.config.discount),  # type: ignore
                 prior_logits=pi_logits,  # type: ignore
                 value=value,  # type: ignore
             ),
@@ -63,9 +75,9 @@ class MuZero:
 
     def _policy_output(
         self,
-        params: Params,
+        model: ModelState,
         key: chex.PRNGKey,
-        latent: Any,
+        latent: chex.Array,
         pi_logits: chex.Array,
         value: chex.Array,
     ) -> mctx.PolicyOutput:
@@ -76,7 +88,7 @@ class MuZero:
         )
 
         return mctx.gumbel_muzero_policy(
-            params=params,
+            params=model,
             rng_key=key,
             root=root,
             recurrent_fn=self._recurrent_fn,
@@ -90,16 +102,27 @@ class MuZero:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def predict(self, params: Params, key: chex.PRNGKey, obs: Any) -> int:
-        latent = self.rep_net.apply(params.representation, obs)
-        pi_logits, value = self.pred_net.apply(params.prediction, latent)
+    def predict(
+        self, model: ModelState, key: chex.PRNGKey, obs: chex.ArrayTree
+    ) -> chex.Array:
+        key, subkey = jax.random.split(key)
+        latent, _ = self.rep_net.apply(
+            model.params.rep,
+            model.state.rep,
+            subkey,
+            jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), obs),
+        )
+        key, subkey = jax.random.split(key)
+        (pi_logits, value), _ = self.pred_net.apply(
+            model.params.pred, model.state.pred, subkey, latent
+        )
 
         policy_output = self._policy_output(
-            params=params,
+            model=model,
             key=key,
-            latent=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), latent),
-            pi_logits=jnp.expand_dims(pi_logits, axis=0),
-            value=jnp.expand_dims(value, axis=0),
+            latent=latent,
+            pi_logits=pi_logits,
+            value=value,
         )
 
         return policy_output.action[0]  # type: ignore
