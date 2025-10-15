@@ -6,7 +6,6 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import optax
-
 from jumanji.environments.routing.pac_man.env import PacMan
 from jumanji.environments.routing.pac_man.types import State
 

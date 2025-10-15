@@ -3,16 +3,16 @@ import functools
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-import rlax
 import chex
-from flashbax.buffers.prioritised_trajectory_buffer import BufferState
+import flashbax as fbx
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import mctx
 import optax
 import orbax.checkpoint as ocp
-import flashbax as fbx
+import rlax
+from flashbax.buffers.prioritised_trajectory_buffer import BufferState
 from jumanji.env import Environment
 
 from .agent import AlphaZero, Config, ModelState
@@ -51,10 +51,10 @@ class TrainState(NamedTuple):
 
 class TimeStep(NamedTuple):
     obs: chex.Array
-    action: chex.Array
     reward: chex.Array
     terminal: chex.Array
     pi: chex.Array
+    action_mask: chex.Array
 
 
 class AlphaZeroTrainer(AlphaZero):
@@ -91,10 +91,10 @@ class AlphaZeroTrainer(AlphaZero):
 
         experience = TimeStep(
             obs=obs[0],
-            action=jnp.zeros((1,), dtype=jnp.int32),
             reward=jnp.zeros((1,), dtype=jnp.float32),
             terminal=jnp.zeros((1,), dtype=jnp.bool_),
             pi=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.float32),
+            action_mask=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.bool_),
         )
         buffer_state = self.buffer.init(experience)
 
@@ -129,6 +129,8 @@ class AlphaZeroTrainer(AlphaZero):
         value_target: chex.Array,
         obs: chex.Array,
     ) -> tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]]:
+        pi_target = jax.lax.stop_gradient(pi_target)
+        value_target = jax.lax.stop_gradient(value_target)
         (pi_logits, value), net_state = self.network.apply(params, net_state, key, obs)
         pi_loss = optax.softmax_cross_entropy(pi_logits, pi_target).mean()
         value_loss = optax.l2_loss(value_target, value).mean()
@@ -213,9 +215,17 @@ class AlphaZeroTrainer(AlphaZero):
         search_policy: chex.Array,
         search_value: chex.Array,
         obs: chex.Array,
+        action_mask: chex.Array,
     ) -> tuple[
         tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]], chex.Array
     ]:
+        masked = search_policy * action_mask
+        sum_ = jnp.sum(masked, axis=-1, keepdims=True)
+        legal_cnt = jnp.sum(action_mask, axis=-1, keepdims=True)
+        uniform_legal = jnp.where(
+            action_mask > 0, 1.0 / jnp.maximum(legal_cnt, 1), 0.0
+        )
+        pi_target = jnp.where(sum_ > 0, masked / jnp.clip(sum_, 1e-10), uniform_legal)
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
         )(model.params, model.state, key, search_policy, search_value, obs)
@@ -250,13 +260,14 @@ class AlphaZeroTrainer(AlphaZero):
             env_states, reward, terminal = self._step_env(
                 subkey, state.env_states, policy_output.action
             )
+            action_mask = jax.vmap(self.action_mask_fn)(env_states)
 
             experience = TimeStep(
                 obs=obs.astype(jnp.float32)[:, None, ...],
-                action=policy_output.action[:, None, None, ...],
                 reward=reward[:, None, None, ...],
                 terminal=terminal[:, None, None, ...],
                 pi=pi_target[:, None, ...],
+                action_mask=action_mask[:, None, :],
             )
             buffer_state = self.buffer.add(state.buffer_state, experience)
 
@@ -271,6 +282,7 @@ class AlphaZeroTrainer(AlphaZero):
             reward_seq = sample.experience.reward[..., 0]  # (B, T)
             terminal_seq = sample.experience.terminal[..., 0]  # (B, T)
             pi_seq = sample.experience.pi  # (B, T, A)
+            mask_seq = sample.experience.action_mask  # (B, T, A)
 
             disc_seq = jnp.where(terminal_seq, 0.0, self.config.discount)  # (B, T)
 
@@ -284,22 +296,27 @@ class AlphaZeroTrainer(AlphaZero):
             v_boot = v_boot_flat.reshape(B, K)  # (B, K)
 
             value_seq = jnp.zeros_like(reward_seq)  # (B, T)
-            value_seq = value_seq.at[:, :K].set(v_boot)  # put bootstraps for t=0..K-1
+            # put bootstraps for t=n-1..n+K-1
+            value_seq = value_seq.at[:, n - 1 : n + K - 1].set(v_boot)
 
-            n_step_returns = functools.partial(rlax.n_step_bootstrapped_returns, n=n)
+            n_step_returns = functools.partial(
+                rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
+            )
             z_all = jax.vmap(n_step_returns)(reward_seq, disc_seq, value_seq)  # [B, T]
 
             z_targets = z_all[:, :K]  # (B, K)
             pi_targets = pi_seq[:, :K, :]  # (B, K, A)
             obs_targets = obs_seq[:, :K, ...]  # (B, K, ...)
+            mask_targets = mask_seq[:, :K, :]  # (B, K, A)
 
             flat_obs = obs_targets.reshape(B * K, *obs_targets.shape[2:])  # (B*K, ...)
             flat_pi = pi_targets.reshape(B * K, pi_targets.shape[-1])  # (B*K, A)
             flat_z = z_targets.reshape(B * K)  # (B*K,)
+            flat_mask = mask_targets.reshape(B * K, mask_targets.shape[-1])
 
             key, subkey = jax.random.split(key)
             (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                state.model, subkey, flat_pi, flat_z, flat_obs
+                state.model, subkey, flat_pi, flat_z, flat_obs, flat_mask
             )
             params, opt_state = self._apply_updates(state.model, state.opt_state, grads)
 
@@ -426,20 +443,6 @@ class AlphaZeroTrainer(AlphaZero):
         self.train_checkpointer.save(directory / filename, state)
 
     def restore_checkpoint(self, filename: str, directory: Path):
-        state = TrainState(
-            env_states=None,  # type: ignore
-            model=ModelState(params=None, state=None),  #  type: ignore
-            opt_state=None,  # type: ignore
-            avg_return=None,  # type: ignore
-            avg_loss=None,  # type: ignore
-            avg_pi_loss=None,  # type: ignore
-            avg_value_loss=None,  # type: ignore
-            episode_return=None,  # type: ignore
-            num_episodes=None,  # type: ignore
-            eval_avg_return=None,  # type: ignore
-            eval_episode_return=None,  # type: ignore
-            key=None,  # type: ignore
-        )  # type: ignore
-
+        state = self.init(jax.random.PRNGKey(0))  # create dummy state
         self.train_checkpointer.restore(directory / filename, state)
         return state
