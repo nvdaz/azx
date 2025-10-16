@@ -12,7 +12,9 @@ import mctx
 import optax
 import orbax.checkpoint as ocp
 import rlax
-from flashbax.buffers.prioritised_trajectory_buffer import BufferState
+from flashbax.buffers.prioritised_trajectory_buffer import (
+    PrioritisedTrajectoryBufferState,
+)
 from jumanji.env import Environment
 
 from .agent import AlphaZero, Config, ModelState
@@ -35,26 +37,26 @@ class TrainConfig(Config):
 
 class TrainState(NamedTuple):
     model: ModelState
-    env_states: chex.Array
-    buffer_state: BufferState
+    env_states: jax.Array
+    buffer_state: PrioritisedTrajectoryBufferState
     opt_state: optax.OptState
-    avg_return: chex.Array
-    avg_loss: chex.Array
-    avg_pi_loss: chex.Array
-    avg_value_loss: chex.Array
-    episode_return: chex.Array
-    num_episodes: chex.Array
-    key: chex.Array
+    avg_return: jax.Array
+    avg_loss: jax.Array
+    avg_pi_loss: jax.Array
+    avg_value_loss: jax.Array
+    episode_return: jax.Array
+    num_episodes: jax.Array
+    key: jax.Array
     eval_episode_return: chex.ArrayTree
     eval_avg_return: chex.ArrayTree
 
 
 class TimeStep(NamedTuple):
-    obs: chex.Array
-    reward: chex.Array
-    terminal: chex.Array
-    pi: chex.Array
-    action_mask: chex.Array
+    obs: jax.Array
+    reward: jax.Array
+    terminal: jax.Array
+    pi: jax.Array
+    action_mask: jax.Array
 
 
 class AlphaZeroTrainer(AlphaZero):
@@ -63,8 +65,8 @@ class AlphaZeroTrainer(AlphaZero):
         env: Environment,
         config: TrainConfig,
         network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[chex.ArrayTree], chex.Array],
-        action_mask_fn: Callable[[chex.ArrayTree], chex.Array],
+        obs_fn: Callable[[chex.ArrayTree], jax.Array],
+        action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
         opt: optax.GradientTransformation,
     ):
         super().__init__(env, config, network_fn, obs_fn)
@@ -124,11 +126,11 @@ class AlphaZeroTrainer(AlphaZero):
         self,
         params: hk.MutableParams,
         net_state: hk.MutableState,
-        key: chex.Array,
-        pi_target: chex.Array,
-        value_target: chex.Array,
-        obs: chex.Array,
-    ) -> tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]]:
+        key: jax.Array,
+        pi_target: jax.Array,
+        value_target: jax.Array,
+        obs: jax.Array,
+    ) -> tuple[jax.Array, tuple[hk.MutableState, jax.Array, jax.Array]]:
         pi_target = jax.lax.stop_gradient(pi_target)
         value_target = jax.lax.stop_gradient(value_target)
         (pi_logits, value), net_state = self.network.apply(params, net_state, key, obs)
@@ -142,8 +144,8 @@ class AlphaZeroTrainer(AlphaZero):
         )
 
     def _step_env(
-        self, key: chex.PRNGKey, env_states: chex.ArrayTree, actions: chex.Array
-    ) -> tuple[chex.ArrayTree, chex.Array, chex.Array]:
+        self, key: chex.PRNGKey, env_states: chex.ArrayTree, actions: jax.Array
+    ) -> tuple[chex.ArrayTree, jax.Array, jax.Array]:
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
         batch_reward = jax.vmap(lambda x: x.reward, in_axes=(0,))
@@ -211,24 +213,22 @@ class AlphaZeroTrainer(AlphaZero):
     def _compute_gradients(
         self,
         model: ModelState,
-        key: chex.Array,
-        search_policy: chex.Array,
-        search_value: chex.Array,
-        obs: chex.Array,
-        action_mask: chex.Array,
+        key: jax.Array,
+        search_policy: jax.Array,
+        search_value: jax.Array,
+        obs: jax.Array,
+        action_mask: jax.Array,
     ) -> tuple[
-        tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]], chex.Array
+        tuple[jax.Array, tuple[hk.MutableState, jax.Array, jax.Array]], jax.Array
     ]:
         masked = search_policy * action_mask
         sum_ = jnp.sum(masked, axis=-1, keepdims=True)
         legal_cnt = jnp.sum(action_mask, axis=-1, keepdims=True)
-        uniform_legal = jnp.where(
-            action_mask > 0, 1.0 / jnp.maximum(legal_cnt, 1), 0.0
-        )
+        uniform_legal = jnp.where(action_mask > 0, 1.0 / jnp.maximum(legal_cnt, 1), 0.0)
         pi_target = jnp.where(sum_ > 0, masked / jnp.clip(sum_, 1e-10), uniform_legal)
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(model.params, model.state, key, search_policy, search_value, obs)
+        )(model.params, model.state, key, pi_target, search_value, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
@@ -267,7 +267,7 @@ class AlphaZeroTrainer(AlphaZero):
                 reward=reward[:, None, None, ...],
                 terminal=terminal[:, None, None, ...],
                 pi=pi_target[:, None, ...],
-                action_mask=action_mask[:, None, :],
+                action_mask=action_mask.astype(jnp.bool_)[:, None, :],
             )
             buffer_state = self.buffer.add(state.buffer_state, experience)
 
@@ -358,7 +358,7 @@ class AlphaZeroTrainer(AlphaZero):
         return state
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def evaluate(self, state: TrainState, max_steps: int) -> chex.Array:
+    def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
         batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 

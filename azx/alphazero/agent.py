@@ -30,7 +30,7 @@ class AlphaZero:
         env: Environment,
         config: Config,
         network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[chex.ArrayTree], chex.Array],
+        obs_fn: Callable[[chex.ArrayTree], jax.Array],
     ):
         self.env = env
         self.config = config
@@ -41,8 +41,8 @@ class AlphaZero:
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        actions: chex.Array,
-        env_states: chex.Array,
+        actions: jax.Array,
+        env_states: jax.Array,
     ):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
@@ -71,8 +71,8 @@ class AlphaZero:
         model: ModelState,
         key: chex.PRNGKey,
         env_states: chex.ArrayTree,
-        pi_logits: chex.Array,
-        value: chex.Array,
+        pi_logits: jax.Array,
+        value: jax.Array,
     ) -> mctx.PolicyOutput:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
@@ -101,7 +101,7 @@ class AlphaZero:
         model: ModelState,
         key: chex.PRNGKey,
         env_state: chex.ArrayTree,
-    ) -> chex.Array:
+    ) -> jax.Array:
         key, subkey = jax.random.split(key)
         (pi_logits, value), _ = self.network.apply(
             model.params, model.state, subkey, self.obs_fn(env_state)[None, ...]

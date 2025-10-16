@@ -29,15 +29,15 @@ class TrainConfig(Config):
 
 class TrainState(NamedTuple):
     model: ModelState
-    env_states: chex.Array
+    env_states: jax.Array
     opt_state: optax.OptState
-    avg_return: chex.Array
-    avg_loss: chex.Array
-    avg_pi_loss: chex.Array
-    avg_value_loss: chex.Array
-    episode_return: chex.Array
-    num_episodes: chex.Array
-    key: chex.Array
+    avg_return: jax.Array
+    avg_loss: jax.Array
+    avg_pi_loss: jax.Array
+    avg_value_loss: jax.Array
+    episode_return: jax.Array
+    num_episodes: jax.Array
+    key: jax.Array
     eval_episode_return: chex.ArrayTree
     eval_avg_return: chex.ArrayTree
 
@@ -47,11 +47,11 @@ class MuZeroTrainer(MuZero):
         self,
         env: Environment,
         config: TrainConfig,
-        representation_fn: Callable[[chex.Array], chex.Array],
-        dynamics_fn: Callable[[chex.Array, chex.Array], chex.Array],
-        prediction_fn: Callable[[chex.Array], tuple[chex.Array, chex.Array]],
-        obs_fn: Callable[[chex.ArrayTree], chex.Array],
-        action_mask_fn: Callable[[chex.ArrayTree], chex.Array],
+        representation_fn: Callable[[jax.Array], jax.Array],
+        dynamics_fn: Callable[[jax.Array, jax.Array], jax.Array],
+        prediction_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
+        obs_fn: Callable[[chex.ArrayTree], jax.Array],
+        action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
         opt: optax.GradientTransformation,
     ):
         super().__init__(config, representation_fn, dynamics_fn, prediction_fn)
@@ -110,14 +110,14 @@ class MuZeroTrainer(MuZero):
         self,
         params: ModelParams,
         net_state: ModelNetState,
-        key: chex.Array,
-        pi_target: chex.Array,
-        value_target: chex.Array,
-        reward_target: chex.Array,
-        terminal_target: chex.Array,
-        actions: chex.Array,
-        obs: chex.Array,
-    ) -> tuple[chex.Array, tuple[ModelNetState, chex.Array, chex.Array]]:
+        key: jax.Array,
+        pi_target: jax.Array,
+        value_target: jax.Array,
+        reward_target: jax.Array,
+        terminal_target: jax.Array,
+        actions: jax.Array,
+        obs: jax.Array,
+    ) -> tuple[jax.Array, tuple[ModelNetState, jax.Array, jax.Array]]:
         key, subkey = jax.random.split(key)
         latent, rep_state = self.rep_net.apply(params.rep, net_state.rep, subkey, obs)
         key, subkey = jax.random.split(key)
@@ -138,8 +138,8 @@ class MuZeroTrainer(MuZero):
         )
 
     def _step_env(
-        self, state: TrainState, actions: chex.Array
-    ) -> tuple[TrainState, chex.Array, chex.Array]:
+        self, state: TrainState, actions: jax.Array
+    ) -> tuple[TrainState, jax.Array, jax.Array]:
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
         batch_reward = jax.vmap(lambda x: x.reward, in_axes=(0,))
@@ -212,15 +212,15 @@ class MuZeroTrainer(MuZero):
     def _compute_gradients(
         self,
         model: ModelState,
-        key: chex.Array,
-        search_policy: chex.Array,
-        search_value: chex.Array,
-        obs: chex.Array,
-        actions: chex.Array,
-        reward_targets: chex.Array,
-        terminal_targets: chex.Array,
+        key: jax.Array,
+        search_policy: jax.Array,
+        search_value: jax.Array,
+        obs: jax.Array,
+        actions: jax.Array,
+        reward_targets: jax.Array,
+        terminal_targets: jax.Array,
     ) -> tuple[
-        tuple[chex.Array, tuple[hk.MutableState, chex.Array, chex.Array]], chex.Array
+        tuple[jax.Array, tuple[hk.MutableState, jax.Array, jax.Array]], jax.Array
     ]:
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
@@ -323,7 +323,7 @@ class MuZeroTrainer(MuZero):
         return state
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def evaluate(self, state: TrainState, max_steps: int) -> chex.Array:
+    def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
         batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 

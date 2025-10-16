@@ -39,9 +39,9 @@ class MuZero:
     def __init__(
         self,
         config: Config,
-        representation_fn: Callable[[chex.Array], chex.Array],
-        dynamics_fn: Callable[[chex.Array, chex.Array], chex.Array],
-        prediction_fn: Callable[[chex.Array], tuple[chex.Array, chex.Array]],
+        representation_fn: Callable[[jax.Array], jax.Array],
+        dynamics_fn: Callable[[jax.Array, jax.Array], jax.Array],
+        prediction_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
     ):
         self.config = config
         self.rep_net = hk.transform_with_state(representation_fn)
@@ -52,8 +52,8 @@ class MuZero:
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        actions: chex.Array,
-        latent_states: chex.Array,
+        actions: jax.Array,
+        latent_states: jax.Array,
     ):
         key, subkey = jax.random.split(key)
         (next_latent, reward, terminal), _ = self.dyn_net.apply(
@@ -77,9 +77,9 @@ class MuZero:
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        latent: chex.Array,
-        pi_logits: chex.Array,
-        value: chex.Array,
+        latent: jax.Array,
+        pi_logits: jax.Array,
+        value: jax.Array,
     ) -> mctx.PolicyOutput:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
@@ -104,7 +104,7 @@ class MuZero:
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
         self, model: ModelState, key: chex.PRNGKey, obs: chex.ArrayTree
-    ) -> chex.Array:
+    ) -> jax.Array:
         key, subkey = jax.random.split(key)
         latent, _ = self.rep_net.apply(
             model.params.rep,
