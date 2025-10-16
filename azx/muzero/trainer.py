@@ -2,7 +2,7 @@ import dataclasses
 import functools
 from pathlib import Path
 from typing import Callable, NamedTuple
-
+import flashbax as fbx
 import chex
 import haiku as hk
 import jax
@@ -11,6 +11,9 @@ import mctx
 import optax
 import orbax.checkpoint as ocp
 from jumanji.env import Environment
+from flashbax.buffers.prioritised_trajectory_buffer import (
+    PrioritisedTrajectoryBufferState,
+)
 
 from .agent import Config, ModelNetState, ModelParams, ModelState, MuZero
 
@@ -19,16 +22,20 @@ from .agent import Config, ModelNetState, ModelParams, ModelState, MuZero
 class TrainConfig(Config):
     batch_size: int
     eval_frequency: int
+    n_step: int
+    unroll_steps: int
     max_eval_steps: int
-    value_target: str
     avg_return_smoothing: float
     dirichlet_alpha: float
     dirichlet_mix: float
     checkpoint_frequency: int
+    max_length_buffer: int
+    min_length_buffer: int
 
 
 class TrainState(NamedTuple):
     model: ModelState
+    buffer_state: PrioritisedTrajectoryBufferState
     env_states: jax.Array
     opt_state: optax.OptState
     avg_return: jax.Array
@@ -40,6 +47,14 @@ class TrainState(NamedTuple):
     key: jax.Array
     eval_episode_return: chex.ArrayTree
     eval_avg_return: chex.ArrayTree
+
+
+class TimeStep(NamedTuple):
+    obs: jax.Array
+    reward: jax.Array
+    terminal: jax.Array
+    pi: jax.Array
+    action_mask: jax.Array
 
 
 class MuZeroTrainer(MuZero):
@@ -61,12 +76,29 @@ class MuZeroTrainer(MuZero):
         self.config = config
         self.action_mask_fn = action_mask_fn
         self.train_checkpointer = ocp.StandardCheckpointer()
+        self.buffer = fbx.make_prioritised_trajectory_buffer(
+            max_length_time_axis=config.max_length_buffer,
+            min_length_time_axis=config.min_length_buffer,
+            sample_batch_size=config.batch_size,
+            add_batch_size=config.batch_size,
+            sample_sequence_length=config.n_step + config.unroll_steps,
+            period=1,
+        )
 
     def init(self, key: chex.PRNGKey) -> TrainState:
         key, subkey = jax.random.split(key)
         state, _ = self.env.reset(subkey)
 
         obs = self.obs_fn(state)[None, ...]
+
+        experience = TimeStep(
+            obs=obs[0],
+            reward=jnp.zeros((1,), dtype=jnp.float32),
+            terminal=jnp.zeros((1,), dtype=jnp.bool_),
+            pi=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.float32),
+            action_mask=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.bool_),
+        )
+        buffer_state = self.buffer.init(experience)
 
         key, subkey = jax.random.split(key)
         rep_params, rep_state = self.rep_net.init(subkey, obs)
@@ -93,6 +125,7 @@ class MuZeroTrainer(MuZero):
 
         return TrainState(
             model=model,
+            buffer_state=buffer_state,
             env_states=env_states,
             opt_state=opt_state,
             avg_return=jnp.zeros(self.config.batch_size),
@@ -113,17 +146,13 @@ class MuZeroTrainer(MuZero):
         key: jax.Array,
         pi_target: jax.Array,
         value_target: jax.Array,
-        reward_target: jax.Array,
-        terminal_target: jax.Array,
-        actions: jax.Array,
         obs: jax.Array,
     ) -> tuple[jax.Array, tuple[ModelNetState, jax.Array, jax.Array]]:
+        pi_target = jax.lax.stop_gradient(pi_target)
+        value_target = jax.lax.stop_gradient(value_target)
         key, subkey = jax.random.split(key)
         latent, rep_state = self.rep_net.apply(params.rep, net_state.rep, subkey, obs)
         key, subkey = jax.random.split(key)
-        (_, rewards, terminals), dyn_state = self.dyn_net.apply(
-            params.dyn, net_state.dyn, subkey, latent, actions
-        )
         (pi_logits, value), pred_state = self.pred_net.apply(
             params.pred, net_state.pred, key, latent
         )
@@ -132,24 +161,24 @@ class MuZeroTrainer(MuZero):
         value_loss = optax.l2_loss(value, value_target).mean()
 
         return pi_loss + value_loss, (
-            ModelNetState(rep=rep_state, dyn=dyn_state, pred=pred_state),
+            ModelNetState(rep=rep_state, dyn=net_state.dyn, pred=pred_state),
             jax.lax.stop_gradient(pi_loss),
             jax.lax.stop_gradient(value_loss),
         )
 
     def _step_env(
-        self, state: TrainState, actions: jax.Array
+        self, key: chex.PRNGKey, env_states: chex.ArrayTree, actions: jax.Array
     ) -> tuple[TrainState, jax.Array, jax.Array]:
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
         batch_reward = jax.vmap(lambda x: x.reward, in_axes=(0,))
         batch_terminal = jax.vmap(lambda x: x.last(), in_axes=(0,))
 
-        env_states, steps = batch_step(state.env_states, actions)
+        env_states, steps = batch_step(env_states, actions)
         reward = batch_reward(steps)
         terminal = batch_terminal(steps)
 
-        key, subkey = jax.random.split(state.key)
+        key, subkey = jax.random.split(key)
         subkeys = jax.random.split(subkey, self.config.batch_size)
         reset_states, _ = batch_reset(subkeys)
 
@@ -162,9 +191,7 @@ class MuZeroTrainer(MuZero):
             )
         )(terminal, reset_states, env_states)
 
-        state = state._replace(key=key, env_states=env_states)
-
-        return state, reward, terminal
+        return env_states, reward, terminal
 
     def _muzero_search(self, state: TrainState) -> tuple[TrainState, mctx.PolicyOutput]:
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
@@ -216,37 +243,29 @@ class MuZeroTrainer(MuZero):
         search_policy: jax.Array,
         search_value: jax.Array,
         obs: jax.Array,
-        actions: jax.Array,
-        reward_targets: jax.Array,
-        terminal_targets: jax.Array,
+        action_mask: jax.Array,
     ) -> tuple[
         tuple[jax.Array, tuple[hk.MutableState, jax.Array, jax.Array]], jax.Array
     ]:
+        masked = search_policy * action_mask
+        sum_ = jnp.sum(masked, axis=-1, keepdims=True)
+        legal_cnt = jnp.sum(action_mask, axis=-1, keepdims=True)
+        uniform_legal = jnp.where(action_mask > 0, 1.0 / jnp.maximum(legal_cnt, 1), 0.0)
+        pi_target = jnp.where(sum_ > 0, masked / jnp.clip(sum_, 1e-10), uniform_legal)
+
         (loss, (net_state, pi_loss, value_loss)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(
-            model.params,
-            model.state,
-            key,
-            search_policy,
-            search_value,
-            reward_targets,
-            terminal_targets,
-            actions,
-            obs,
-        )
+        )(model.params, model.state, key, pi_target, search_value, actions, obs)
 
         return (loss, (net_state, pi_loss, value_loss)), grads
 
     def _apply_updates(
-        self, state: TrainState, grads: optax.Updates, net_state: ModelNetState
-    ) -> TrainState:
-        updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
-        params = optax.apply_updates(state.model.params, updates)
+        self, params0: ModelState, opt_state: optax.OptState, grads: optax.Updates
+    ) -> tuple[hk.MutableParams, optax.OptState]:
+        updates, opt_state = self.opt.update(grads, opt_state, params0)
+        params = optax.apply_updates(params0, updates)
 
-        return state._replace(
-            model=ModelState(params=params, state=net_state), opt_state=opt_state
-        )
+        return params, opt_state
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
@@ -259,41 +278,77 @@ class MuZeroTrainer(MuZero):
             count_sums = jnp.maximum(count_sums, 1.0)
             pi_target = raw_counts / count_sums
 
-            if self.config.value_target == "maxq":
-                ROOT = policy_output.search_tree.ROOT_INDEX
-                root_indices = jnp.full((self.config.batch_size,), ROOT)
-                qvalues = policy_output.search_tree.qvalues(root_indices)
-                v_target = qvalues[
-                    jnp.arange(self.config.batch_size), policy_output.action
-                ]
-            elif self.config.value_target == "nodev":
-                ROOT = policy_output.search_tree.ROOT_INDEX
-                v_target = policy_output.search_tree.node_values[:, ROOT]
-            else:
-                raise ValueError("Unknown value target.")
-
-            env_obs = batch_obs(state.env_states)
-            state, reward, terminals = self._step_env(state, policy_output.action)
-
+            obs = batch_obs(state.env_states)
             key, subkey = jax.random.split(state.key)
-            (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                state.model,
-                subkey,
-                pi_target,
-                v_target,
-                env_obs,
-                policy_output.action,
-                reward,
-                terminals,
+            env_states, reward, terminal = self._step_env(
+                subkey, state.env_states, policy_output.action
+            )
+            action_mask = jax.vmap(self.action_mask_fn)(env_states)
+
+            experience = TimeStep(
+                obs=obs.astype(jnp.float32)[:, None, ...],
+                reward=reward[:, None, None, ...],
+                terminal=terminal[:, None, None, ...],
+                pi=pi_target[:, None, ...],
+                action_mask=action_mask.astype(jnp.bool_)[:, None, ...],
             )
 
-            state = self._apply_updates(state, grads, net_state)
+            key, subkey = jax.random.split(key)
+            sample = self.buffer.sample(state.buffer_state, subkey)
+
+            B = self.config.batch_size
+            K = self.config.unroll_steps
+            n = self.config.n_step
+
+            obs_seq = sample.experience.obs  # (B, T, ...)
+            reward_seq = sample.experience.reward[..., 0]  # (B, T)
+            terminal_seq = sample.experience.terminal[..., 0]  # (B, T)
+            pi_seq = sample.experience.pi  # (B, T, A)
+            mask_seq = sample.experience.action_mask  # (B, T, A)
+
+            disc_seq = jnp.where(terminal_seq, 0.0, self.config.discount)  # (B, T)
+
+            # bootstrap values at indices t+k+n.
+            boot_obs = obs_seq[:, n : n + K]  # (B, K, ...)
+            flat_boot_obs = boot_obs.reshape(B * K, *boot_obs.shape[2:])
+            key, subkey = jax.random.split(key)
+            (_, v_boot_flat), _ = self.network.apply(
+                state.model.params, state.model.state, subkey, flat_boot_obs
+            )
+            v_boot = v_boot_flat.reshape(B, K)  # (B, K)
+
+            value_seq = jnp.zeros_like(reward_seq)  # (B, T)
+            # put bootstraps for t=n-1..n+K-1
+            value_seq = value_seq.at[:, n - 1 : n + K - 1].set(v_boot)
+
+            n_step_returns = functools.partial(
+                rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
+            )
+            z_all = jax.vmap(n_step_returns)(reward_seq, disc_seq, value_seq)  # [B, T]
+
+            z_targets = z_all[:, :K]  # (B, K)
+            pi_targets = pi_seq[:, :K, :]  # (B, K, A)
+            obs_targets = obs_seq[:, :K, ...]  # (B, K, ...)
+            mask_targets = mask_seq[:, :K, :]  # (B, K, A)
+
+            flat_obs = obs_targets.reshape(B * K, *obs_targets.shape[2:])  # (B*K, ...)
+            flat_pi = pi_targets.reshape(B * K, pi_targets.shape[-1])  # (B*K, A)
+            flat_z = z_targets.reshape(B * K)  # (B*K,)
+            flat_mask = mask_targets.reshape(B * K, mask_targets.shape[-1])
+
+            key, subkey = jax.random.split(key)
+            (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
+                state.model, subkey, flat_pi, flat_z, flat_obs, flat_mask
+            )
+
+
+            params, opt_state = self._apply_updates(state, grads, net_state)
 
             new_return = state.episode_return + reward
 
             next_episode_return = jnp.where(terminals, 0, new_return)
             next_avg_return = jnp.where(
-                terminals,
+                terminal,
                 state.avg_return * self.config.avg_return_smoothing
                 + new_return * (1 - self.config.avg_return_smoothing),
                 state.avg_return,
@@ -306,10 +361,13 @@ class MuZeroTrainer(MuZero):
                 state.avg_value_loss * self.config.avg_return_smoothing
                 + value_loss * (1 - self.config.avg_return_smoothing)
             )
-            next_num_episodes = state.num_episodes + terminals.astype(jnp.int32)
+            next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
 
             state = state._replace(
+                model=ModelState(params=params, state=net_state),
+                opt_state=opt_state,
                 key=key,
+                buffer_state=buffer_state,
                 episode_return=next_episode_return,
                 avg_return=next_avg_return,
                 num_episodes=next_num_episodes,
@@ -408,23 +466,6 @@ class MuZeroTrainer(MuZero):
         self.train_checkpointer.save(directory / filename, state)
 
     def restore_checkpoint(self, filename: str, directory: Path):
-        state = TrainState(
-            env_states=None,  # type: ignore
-            model=ModelState(
-                params=ModelParams(rep=None, dyn=None, pred=None),  # type: ignore
-                state=ModelNetState(rep=None, dyn=None, pred=None),  # type: ignore
-            ),
-            opt_state=None,  # type: ignore
-            avg_return=None,  # type: ignore
-            avg_loss=None,  # type: ignore
-            avg_pi_loss=None,  # type: ignore
-            avg_value_loss=None,  # type: ignore
-            episode_return=None,  # type: ignore
-            num_episodes=None,  # type: ignore
-            eval_avg_return=None,  # type: ignore
-            eval_episode_return=None,  # type: ignore
-            key=None,  # type: ignore
-        )  # type: ignore
-
+        state = self.init(jax.random.PRNGKey(0)) # create dummy state
         self.train_checkpointer.restore(directory / filename, state)
         return state

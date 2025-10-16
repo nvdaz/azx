@@ -175,7 +175,6 @@ class AlphaZeroTrainer(AlphaZero):
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
 
         env_obs = batch_obs(state.env_states)
-
         key, subkey = jax.random.split(state.key)
         (pi_logits, value), _ = self.network.apply(
             state.model.params, state.model.state, subkey, env_obs
@@ -234,12 +233,12 @@ class AlphaZeroTrainer(AlphaZero):
 
     def _apply_updates(
         self,
-        model: ModelState,
+        params0: hk.MutableParams,
         opt_state: optax.OptState,
         grads: optax.Updates,
     ) -> tuple[hk.MutableParams, optax.OptState]:
-        updates, opt_state = self.opt.update(grads, opt_state, model.params)
-        params = optax.apply_updates(model.params, updates)
+        updates, opt_state = self.opt.update(grads, opt_state, params0)
+        params = optax.apply_updates(params0, updates)
         return params, opt_state
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -267,7 +266,7 @@ class AlphaZeroTrainer(AlphaZero):
                 reward=reward[:, None, None, ...],
                 terminal=terminal[:, None, None, ...],
                 pi=pi_target[:, None, ...],
-                action_mask=action_mask.astype(jnp.bool_)[:, None, :],
+                action_mask=action_mask.astype(jnp.bool_)[:, None, ...],
             )
             buffer_state = self.buffer.add(state.buffer_state, experience)
 
@@ -318,7 +317,7 @@ class AlphaZeroTrainer(AlphaZero):
             (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
                 state.model, subkey, flat_pi, flat_z, flat_obs, flat_mask
             )
-            params, opt_state = self._apply_updates(state.model, state.opt_state, grads)
+            params, opt_state = self._apply_updates(state.model.params, state.opt_state, grads)
 
             new_return = state.episode_return + reward
 

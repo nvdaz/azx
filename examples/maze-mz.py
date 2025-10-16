@@ -14,8 +14,9 @@ config = TrainConfig(
     discount=0.99,
     use_mixed_value=True,
     value_scale=1.0,
-    value_target="maxq",
     batch_size=32,
+    n_step=8,
+    unroll_steps=4,
     avg_return_smoothing=0.99,
     num_simulations=50,
     eval_frequency=1000,
@@ -24,6 +25,8 @@ config = TrainConfig(
     dirichlet_mix=0,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
+    max_length_buffer=64,
+    min_length_buffer=8,
 )
 
 
@@ -86,12 +89,15 @@ class PredictionModel(hk.Module):
         value = jnp.squeeze(hk.Linear(1)(x), -1)  # (B)
         return pi_logits, value
 
+
 env = Maze(RandomGenerator(5, 5))
 action_dim = env.action_spec.num_values
 latent_dim = 64
 
+
 def action_mask_fn(state):
     return state.action_mask
+
 
 trainer = MuZeroTrainer(
     env=env,
