@@ -12,9 +12,7 @@ import mctx
 import optax
 import orbax.checkpoint as ocp
 import rlax
-from flashbax.buffers.prioritised_trajectory_buffer import (
-    PrioritisedTrajectoryBufferState,
-)
+from flashbax.buffers.trajectory_buffer import TrajectoryBufferState
 from jumanji.env import Environment
 
 from .agent import AlphaZero, Config, ModelState
@@ -38,7 +36,7 @@ class TrainConfig(Config):
 class TrainState(NamedTuple):
     model: ModelState
     env_states: jax.Array
-    buffer_state: PrioritisedTrajectoryBufferState
+    buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
     avg_return: jax.Array
     avg_loss: jax.Array
@@ -69,12 +67,11 @@ class AlphaZeroTrainer(AlphaZero):
         action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
         opt: optax.GradientTransformation,
     ):
-        super().__init__(env, config, network_fn, obs_fn)
+        super().__init__(env, config, network_fn, obs_fn, action_mask_fn)
         self.opt = opt
         self.config = config
-        self.action_mask_fn = action_mask_fn
         self.train_checkpointer = ocp.StandardCheckpointer()
-        self.buffer = fbx.make_prioritised_trajectory_buffer(
+        self.buffer = fbx.make_trajectory_buffer(
             max_length_time_axis=config.max_length_buffer,
             min_length_time_axis=config.min_length_buffer,
             sample_batch_size=config.batch_size,
@@ -93,8 +90,8 @@ class AlphaZeroTrainer(AlphaZero):
 
         experience = TimeStep(
             obs=obs[0],
-            reward=jnp.zeros((1,), dtype=jnp.float32),
-            terminal=jnp.zeros((1,), dtype=jnp.bool_),
+            reward=jnp.zeros((), dtype=jnp.float32),
+            terminal=jnp.zeros((), dtype=jnp.bool_),
             pi=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.float32),
             action_mask=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.bool_),
         )
@@ -183,28 +180,28 @@ class AlphaZeroTrainer(AlphaZero):
         key, subkey = jax.random.split(key)
         noise_key, mcts_key = jax.random.split(subkey)
 
-        prior_probs = jax.nn.softmax(pi_logits)
+        action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
+        masked_logits = jnp.where(action_mask, pi_logits, -jnp.inf)
+        probs = jax.nn.softmax(masked_logits)
 
-        dirichlet_noise = jax.random.dirichlet(
+        noise = jax.random.dirichlet(
             noise_key,
             jnp.full(self.env.action_spec.num_values, self.config.dirichlet_alpha),
             shape=(self.config.batch_size,),
         )
 
-        action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
-        noisy_priors = (
-            prior_probs * (1 - self.config.dirichlet_mix)
-            + dirichlet_noise * self.config.dirichlet_mix
-        )
-        valid = (noisy_priors > 0.0) & action_mask
-        noisy_logits = jnp.where(valid, jnp.log(noisy_priors), -1e10)
+        mixed = (
+            1.0 - self.config.dirichlet_mix
+        ) * probs + self.config.dirichlet_mix * noise
+        prior_logits = jnp.where(action_mask, jnp.log(jnp.clip(mixed, 1e-12)), -jnp.inf)
 
         policy_output = self._policy_output(
             model=state.model,
             key=mcts_key,
             env_states=state.env_states,
-            pi_logits=noisy_logits,
+            pi_logits=prior_logits,
             value=value,
+            eval=False,
         )
 
         return state._replace(key=key), policy_output
@@ -241,83 +238,102 @@ class AlphaZeroTrainer(AlphaZero):
         params = optax.apply_updates(params0, updates)
         return params, opt_state
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    def _train_from_batch(self, state: TrainState) -> TrainState:
+        key, subkey = jax.random.split(state.key)
+        batch = self.buffer.sample(state.buffer_state, subkey)
+
+        B = self.config.batch_size
+        K = self.config.unroll_steps
+        n = self.config.n_step
+
+        # unpack experience
+        obs_seq = batch.experience.obs  # (B, T, ...)
+        reward_seq = batch.experience.reward  # (B, T)
+        pi_seq = batch.experience.pi  # (B, T, A)
+        mask_seq = batch.experience.action_mask  # (B, T, A)
+        disc_seq = jnp.where(
+            batch.experience.terminal, 0.0, self.config.discount
+        )  # (B, T)
+
+        # bootstrap values at indices t+k+n.
+        boot_obs = obs_seq[:, n : n + K]  # (B, K, ...)
+        flat_boot_obs = boot_obs.reshape(B * K, *boot_obs.shape[2:])
+        key, subkey = jax.random.split(key)
+        (_, v_boot_flat), _ = self.network.apply(
+            state.model.params, state.model.state, subkey, flat_boot_obs
+        )
+        v_boot = v_boot_flat.reshape(B, K)  # (B, K)
+
+        # put bootstraps for t=n..n+K-1
+        value_seq = jnp.zeros_like(reward_seq)  # (B, T)
+        value_seq = value_seq.at[:, n : n + K].set(v_boot)
+
+        n_step_returns = functools.partial(
+            rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
+        )
+        z_all = jax.vmap(n_step_returns)(reward_seq, disc_seq, value_seq)  # [B, T]
+
+        z_targets = z_all[:, :K]  # (B, K)
+        pi_targets = pi_seq[:, :K, :]  # (B, K, A)
+        obs_targets = obs_seq[:, :K, ...]  # (B, K, ...)
+        mask_targets = mask_seq[:, :K, :]  # (B, K, A)
+
+        flat_obs = obs_targets.reshape(B * K, *obs_targets.shape[2:])  # (B*K, ...)
+        flat_pi = pi_targets.reshape(B * K, pi_targets.shape[-1])  # (B*K, A)
+        flat_z = z_targets.reshape(B * K)  # (B*K,)
+        flat_mask = mask_targets.reshape(B * K, mask_targets.shape[-1])
+
+        key, subkey = jax.random.split(key)
+        (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
+            state.model, subkey, flat_pi, flat_z, flat_obs, flat_mask
+        )
+        params, opt_state = self._apply_updates(
+            state.model.params, state.opt_state, grads
+        )
+
+        next_avg_pi_loss = state.avg_pi_loss * self.config.avg_return_smoothing + (
+            pi_loss
+        ) * (1 - self.config.avg_return_smoothing)
+        next_avg_value_loss = (
+            state.avg_value_loss * self.config.avg_return_smoothing
+            + value_loss * (1 - self.config.avg_return_smoothing)
+        )
+
+        return state._replace(
+            key=key,
+            model=ModelState(params=params, state=net_state),
+            opt_state=opt_state,
+            avg_pi_loss=next_avg_pi_loss,
+            avg_value_loss=next_avg_value_loss,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def train_step(self, state: TrainState) -> TrainState:
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
 
         def loop_fn(state: TrainState, _):
             state, policy_output = self._alphazero_search(state)
 
-            raw_counts = policy_output.action_weights  # shape: [batch, num_actions]
-            count_sums = jnp.sum(raw_counts, axis=-1, keepdims=True)
-            count_sums = jnp.maximum(count_sums, 1.0)
+            raw_counts = policy_output.action_weights  # (B, A)
+            count_sums = jnp.maximum(jnp.sum(raw_counts, axis=-1, keepdims=True), 1.0)
             pi_target = raw_counts / count_sums
 
             obs = batch_obs(state.env_states)
+            action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
 
             key, subkey = jax.random.split(state.key)
             env_states, reward, terminal = self._step_env(
                 subkey, state.env_states, policy_output.action
             )
-            action_mask = jax.vmap(self.action_mask_fn)(env_states)
 
             experience = TimeStep(
                 obs=obs.astype(jnp.float32)[:, None, ...],
-                reward=reward[:, None, None, ...],
-                terminal=terminal[:, None, None, ...],
+                reward=reward[:, None, ...],
+                terminal=terminal[:, None, ...],
                 pi=pi_target[:, None, ...],
                 action_mask=action_mask.astype(jnp.bool_)[:, None, ...],
             )
             buffer_state = self.buffer.add(state.buffer_state, experience)
-
-            key, subkey = jax.random.split(key)
-            sample = self.buffer.sample(buffer_state, subkey)
-
-            B = self.config.batch_size
-            K = self.config.unroll_steps
-            n = self.config.n_step
-
-            obs_seq = sample.experience.obs  # (B, T, ...)
-            reward_seq = sample.experience.reward[..., 0]  # (B, T)
-            terminal_seq = sample.experience.terminal[..., 0]  # (B, T)
-            pi_seq = sample.experience.pi  # (B, T, A)
-            mask_seq = sample.experience.action_mask  # (B, T, A)
-
-            disc_seq = jnp.where(terminal_seq, 0.0, self.config.discount)  # (B, T)
-
-            # bootstrap values at indices t+k+n.
-            boot_obs = obs_seq[:, n : n + K]  # (B, K, ...)
-            flat_boot_obs = boot_obs.reshape(B * K, *boot_obs.shape[2:])
-            key, subkey = jax.random.split(key)
-            (_, v_boot_flat), _ = self.network.apply(
-                state.model.params, state.model.state, subkey, flat_boot_obs
-            )
-            v_boot = v_boot_flat.reshape(B, K)  # (B, K)
-
-            value_seq = jnp.zeros_like(reward_seq)  # (B, T)
-            # put bootstraps for t=n-1..n+K-1
-            value_seq = value_seq.at[:, n - 1 : n + K - 1].set(v_boot)
-
-            n_step_returns = functools.partial(
-                rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
-            )
-            z_all = jax.vmap(n_step_returns)(reward_seq, disc_seq, value_seq)  # [B, T]
-
-            z_targets = z_all[:, :K]  # (B, K)
-            pi_targets = pi_seq[:, :K, :]  # (B, K, A)
-            obs_targets = obs_seq[:, :K, ...]  # (B, K, ...)
-            mask_targets = mask_seq[:, :K, :]  # (B, K, A)
-
-            flat_obs = obs_targets.reshape(B * K, *obs_targets.shape[2:])  # (B*K, ...)
-            flat_pi = pi_targets.reshape(B * K, pi_targets.shape[-1])  # (B*K, A)
-            flat_z = z_targets.reshape(B * K)  # (B*K,)
-            flat_mask = mask_targets.reshape(B * K, mask_targets.shape[-1])
-
-            key, subkey = jax.random.split(key)
-            (loss, (net_state, pi_loss, value_loss)), grads = self._compute_gradients(
-                state.model, subkey, flat_pi, flat_z, flat_obs, flat_mask
-            )
-            params, opt_state = self._apply_updates(state.model.params, state.opt_state, grads)
 
             new_return = state.episode_return + reward
 
@@ -328,27 +344,22 @@ class AlphaZeroTrainer(AlphaZero):
                 + new_return * (1 - self.config.avg_return_smoothing),
                 state.avg_return,
             )
-            next_avg_pi_loss = (
-                state.avg_pi_loss * self.config.avg_return_smoothing
-                + pi_loss * (1 - self.config.avg_return_smoothing)
-            )
-            next_avg_value_loss = (
-                state.avg_value_loss * self.config.avg_return_smoothing
-                + value_loss * (1 - self.config.avg_return_smoothing)
-            )
             next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
 
             state = state._replace(
-                model=ModelState(params=params, state=net_state),
-                opt_state=opt_state,
                 key=key,
                 buffer_state=buffer_state,
                 env_states=env_states,
                 episode_return=next_episode_return,
                 avg_return=next_avg_return,
                 num_episodes=next_num_episodes,
-                avg_pi_loss=next_avg_pi_loss,
-                avg_value_loss=next_avg_value_loss,
+            )
+
+            state = jax.lax.cond(
+                self.buffer.can_sample(state.buffer_state),
+                self._train_from_batch,
+                lambda st: st,
+                state,
             )
 
             return state, None
@@ -362,7 +373,7 @@ class AlphaZeroTrainer(AlphaZero):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
         def single_action(env_state, key):
-            return self.predict(state.model, key, env_state)
+            return self.predict(state.model, key, env_state, eval=True)
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 
