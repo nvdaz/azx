@@ -30,19 +30,21 @@ class AlphaZero:
         env: Environment,
         config: Config,
         network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[chex.ArrayTree], chex.Array],
+        obs_fn: Callable[[chex.ArrayTree], jax.Array],
+        action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
     ):
         self.env = env
         self.config = config
         self.network = hk.transform_with_state(network_fn)
         self.obs_fn = obs_fn
+        self.action_mask_fn = action_mask_fn
 
     def _recurrent_fn(
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        actions: chex.Array,
-        env_states: chex.Array,
+        actions: jax.Array,
+        env_states: jax.Array,
     ):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
@@ -55,6 +57,8 @@ class AlphaZero:
         terminals = batch_terminals(steps)
 
         (pi_logits, value), _ = self.network.apply(model.params, model.state, key, obs)
+        mask = jax.vmap(self.action_mask_fn)(env_states)
+        pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
 
         return (
             mctx.RecurrentFnOutput(
@@ -71,8 +75,9 @@ class AlphaZero:
         model: ModelState,
         key: chex.PRNGKey,
         env_states: chex.ArrayTree,
-        pi_logits: chex.Array,
-        value: chex.Array,
+        pi_logits: jax.Array,
+        value: jax.Array,
+        eval: bool,
     ) -> mctx.PolicyOutput:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
@@ -92,7 +97,7 @@ class AlphaZero:
                 use_mixed_value=self.config.use_mixed_value,
                 value_scale=self.config.value_scale,
             ),
-            gumbel_scale=self.config.gumbel_scale,
+            gumbel_scale=jnp.where(eval, 0.0, self.config.gumbel_scale),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -101,11 +106,14 @@ class AlphaZero:
         model: ModelState,
         key: chex.PRNGKey,
         env_state: chex.ArrayTree,
-    ) -> chex.Array:
+        eval: bool = False,
+    ) -> jax.Array:
         key, subkey = jax.random.split(key)
         (pi_logits, value), _ = self.network.apply(
             model.params, model.state, subkey, self.obs_fn(env_state)[None, ...]
         )  # ignore new state for inference
+        mask = self.action_mask_fn(env_state)
+        pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
 
         policy_output = self._policy_output(
             model=model,
@@ -113,6 +121,7 @@ class AlphaZero:
             env_states=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state),
             pi_logits=pi_logits,
             value=value,
+            eval=eval,
         )
 
         return policy_output.action[0]  # type: ignore
