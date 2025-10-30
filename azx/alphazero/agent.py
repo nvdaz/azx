@@ -57,7 +57,7 @@ class AlphaZero:
         terminals = batch_terminals(steps)
 
         (pi_logits, value), _ = self.network.apply(model.params, model.state, key, obs)
-        mask = self.action_mask_fn(env_states)
+        mask = jax.vmap(self.action_mask_fn)(env_states)
         pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
 
         return (
