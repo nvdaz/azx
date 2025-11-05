@@ -22,7 +22,7 @@ config = TrainConfig(
     eval_frequency=1000,
     max_eval_steps=1000,
     dirichlet_alpha=0.3,
-    dirichlet_mix=0,
+    dirichlet_mix=0.25,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
     max_length_buffer=64,
@@ -75,6 +75,9 @@ class DynamicsModel(hk.Module):
         reward = jnp.squeeze(hk.Linear(1)(x), -1)  # (B,)
         terminal = jnp.squeeze(hk.Linear(1)(x), -1)  # (B,)
 
+        reward = jax.nn.tanh(reward)
+        terminal = jax.nn.tanh(terminal)
+
         return next_latent, reward, terminal
 
 
@@ -87,6 +90,7 @@ class PredictionModel(hk.Module):
         x = hk.nets.MLP([128, 128])(x)  # (B, 128)
         pi_logits = hk.Linear(self.action_dim)(x)  # (B, A)
         value = jnp.squeeze(hk.Linear(1)(x), -1)  # (B)
+        value = jax.nn.tanh(value)
         return pi_logits, value
 
 

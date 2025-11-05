@@ -80,6 +80,7 @@ class MuZero:
         latent: jax.Array,
         pi_logits: jax.Array,
         value: jax.Array,
+        eval: bool,
     ) -> mctx.PolicyOutput:
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
@@ -98,12 +99,16 @@ class MuZero:
                 use_mixed_value=self.config.use_mixed_value,
                 value_scale=self.config.value_scale,
             ),
-            gumbel_scale=self.config.gumbel_scale,
+            gumbel_scale=jnp.where(eval, 0.0, self.config.gumbel_scale),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
-        self, model: ModelState, key: chex.PRNGKey, obs: chex.ArrayTree
+        self,
+        model: ModelState,
+        key: chex.PRNGKey,
+        obs: chex.ArrayTree,
+        eval: bool = False,
     ) -> jax.Array:
         key, subkey = jax.random.split(key)
         latent, _ = self.rep_net.apply(
@@ -123,6 +128,7 @@ class MuZero:
             latent=latent,
             pi_logits=pi_logits,
             value=value,
+            eval=eval,
         )
 
         return policy_output.action[0]  # type: ignore
