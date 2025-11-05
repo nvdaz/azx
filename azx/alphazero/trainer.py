@@ -112,9 +112,9 @@ class AlphaZeroTrainer(AlphaZero):
             buffer_state=buffer_state,
             opt_state=opt_state,
             avg_return=jnp.zeros(self.config.batch_size),
-            avg_loss=jnp.zeros(self.config.batch_size),
-            avg_pi_loss=jnp.zeros(self.config.batch_size),
-            avg_value_loss=jnp.zeros(self.config.batch_size),
+            avg_loss=0.0,
+            avg_pi_loss=0.0,
+            avg_value_loss=0.0,
             episode_return=jnp.zeros(self.config.batch_size),
             num_episodes=jnp.zeros(self.config.batch_size),
             eval_avg_return=jnp.zeros(self.config.batch_size),
@@ -179,17 +179,19 @@ class AlphaZeroTrainer(AlphaZero):
         logits_t = logits_all[:, :K]
         pi_t = target_pi[:, :K]
         mask_t = action_mask[:, :K]
+        row_ok = mask_t.any(axis=-1, keepdims=True)
 
         masked_logits = jnp.where(
-            mask_t, logits_t, jnp.array(1e-9, dtype=logits_t.dtype)
+            mask_t, logits_t, jnp.array(-1e9, dtype=logits_t.dtype)
         )
         masked_targets = pi_t * mask_t
         target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
-        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
+        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm)
+        loss_pi = jnp.where(row_ok[:, :, 0], loss_pi, jnp.full_like(loss_pi, 0)).mean()
         loss_v = optax.squared_error(v_t, z_t).mean()
 
-        total_loss = loss_pi + loss_v
+        total_loss = loss_pi + 0.5 * loss_v
 
         return total_loss, (
             pred_state_new,
@@ -244,6 +246,8 @@ class AlphaZeroTrainer(AlphaZero):
             jnp.full(self.env.action_spec.num_values, self.config.dirichlet_alpha),
             shape=(self.config.batch_size,),
         )
+        noise = noise * action_mask
+        noise = noise / (noise.sum(-1, keepdims=True) + 1e-12)
 
         mixed = (
             1.0 - self.config.dirichlet_mix
@@ -261,41 +265,16 @@ class AlphaZeroTrainer(AlphaZero):
 
         return state._replace(key=key), policy_output
 
-    def _compute_gradients(
-        self,
-        model: ModelState,
-        key: jax.Array,
-        batch: TrajectoryBufferSample,
-    ) -> tuple[
-        tuple[jax.Array, tuple[hk.MutableState, jax.Array, jax.Array]], jax.Array
-    ]:
-        (loss, (net_state, loss_v, loss_pi)), grads = jax.value_and_grad(
-            self._loss_fn, argnums=0, has_aux=True
-        )(model.params, model.state, key, batch)
-
-        return (loss, (net_state, loss_v, loss_pi)), grads
-
-    def _apply_updates(
-        self,
-        params0: hk.MutableParams,
-        opt_state: optax.OptState,
-        grads: optax.Updates,
-    ) -> tuple[hk.MutableParams, optax.OptState]:
-        updates, opt_state = self.opt.update(grads, opt_state, params0)
-        params = optax.apply_updates(params0, updates)
-        return params, opt_state
-
     def _train_from_batch(self, state: TrainState) -> TrainState:
         key, subkey = jax.random.split(state.key)
         batch = self.buffer.sample(state.buffer_state, subkey)
 
-        (loss, (net_state, loss_v, loss_pi)), grads = self._compute_gradients(
-            state.model, subkey, batch
-        )
+        (loss, (net_state, loss_v, loss_pi)), grads = jax.value_and_grad(
+            self._loss_fn, argnums=0, has_aux=True
+        )(state.model.params, state.model.state, subkey, batch)
 
-        params, opt_state = self._apply_updates(
-            state.model.params, state.opt_state, grads
-        )
+        updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
+        params = optax.apply_updates(state.model.params, updates)
 
         avg_pi = state.avg_pi_loss * self.config.avg_return_smoothing + loss_pi * (
             1 - self.config.avg_return_smoothing
@@ -349,8 +328,7 @@ class AlphaZeroTrainer(AlphaZero):
             next_episode_return = jnp.where(terminal, 0, new_return)
             next_avg_return = jnp.where(
                 terminal,
-                state.avg_return * self.config.avg_return_smoothing
-                + new_return * (1 - self.config.avg_return_smoothing),
+                new_return,
                 state.avg_return,
             )
             next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)

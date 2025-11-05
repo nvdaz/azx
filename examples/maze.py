@@ -7,8 +7,8 @@ import optax
 from jumanji.environments.routing.maze.env import Maze
 from jumanji.environments.routing.maze.generator import RandomGenerator
 from jumanji.environments.routing.maze.types import State
-from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
 
+from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
 
 config = TrainConfig(
     discount=0.99,
@@ -18,7 +18,7 @@ config = TrainConfig(
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=5,
+    num_simulations=200,
     eval_frequency=100,
     max_eval_steps=100,
     dirichlet_alpha=0.3,
@@ -51,7 +51,7 @@ class MLP(hk.Module):
         v = hk.Linear(128)(x)
         v = self.act(v)
         v = hk.Linear(1, w_init=self.head_init)(v)
-        value = jnp.tanh(v[..., 0])  
+        value = jnp.tanh(v[..., 0])
 
         return pi_logits, value
 
