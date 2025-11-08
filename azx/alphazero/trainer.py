@@ -8,7 +8,6 @@ import flashbax as fbx
 import haiku as hk
 import jax
 import jax.numpy as jnp
-import mctx
 import optax
 import orbax.checkpoint as ocp
 import rlax
@@ -29,8 +28,6 @@ class TrainConfig(Config):
     unroll_steps: int
     max_eval_steps: int
     avg_return_smoothing: float
-    dirichlet_alpha: float
-    dirichlet_mix: float
     checkpoint_frequency: int
     max_length_buffer: int
     min_length_buffer: int
@@ -225,46 +222,6 @@ class AlphaZeroTrainer(AlphaZero):
 
         return env_states, reward, terminal
 
-    def _alphazero_search(
-        self, state: TrainState
-    ) -> tuple[TrainState, mctx.PolicyOutput]:
-        env_obs = jax.vmap(self.obs_fn)(state.env_states)
-        key, subkey = jax.random.split(state.key)
-        (pi_logits, value), _ = self.network.apply(
-            state.model.params, state.model.state, subkey, env_obs
-        )
-
-        key, subkey = jax.random.split(key)
-        noise_key, mcts_key = jax.random.split(subkey)
-
-        action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
-        masked_logits = jnp.where(action_mask, pi_logits, -jnp.inf)
-        probs = jax.nn.softmax(masked_logits)
-
-        noise = jax.random.dirichlet(
-            noise_key,
-            jnp.full(self.env.action_spec.num_values, self.config.dirichlet_alpha),
-            shape=(self.config.batch_size,),
-        )
-        noise = noise * action_mask
-        noise = noise / (noise.sum(-1, keepdims=True) + 1e-12)
-
-        mixed = (
-            1.0 - self.config.dirichlet_mix
-        ) * probs + self.config.dirichlet_mix * noise
-        prior_logits = jnp.where(action_mask, jnp.log(jnp.clip(mixed, 1e-12)), -jnp.inf)
-
-        policy_output = self._policy_output(
-            model=state.model,
-            key=mcts_key,
-            env_states=state.env_states,
-            pi_logits=prior_logits,
-            value=value,
-            eval=False,
-        )
-
-        return state._replace(key=key), policy_output
-
     def _train_from_batch(self, state: TrainState) -> TrainState:
         key, subkey = jax.random.split(state.key)
         batch = self.buffer.sample(state.buffer_state, subkey)
@@ -300,7 +257,13 @@ class AlphaZeroTrainer(AlphaZero):
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
 
         def loop_fn(state: TrainState, _):
-            state, policy_output = self._alphazero_search(state)
+            key, search_key, step_key = jax.random.split(state.key, 3)
+            policy_output = self._alphazero_search(
+                model=state.model,
+                key=search_key,
+                env_states=state.env_states,
+                eval=False,
+            )
 
             raw_counts = policy_output.action_weights  # (B, A)
             count_sums = jnp.maximum(jnp.sum(raw_counts, axis=-1, keepdims=True), 1.0)
@@ -309,9 +272,8 @@ class AlphaZeroTrainer(AlphaZero):
             obs = batch_obs(state.env_states)
             action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
 
-            key, subkey = jax.random.split(state.key)
             env_states, reward, terminal = self._step_env(
-                subkey, state.env_states, policy_output.action
+                step_key, state.env_states, policy_output.action
             )
 
             experience = TimeStep(
@@ -360,7 +322,7 @@ class AlphaZeroTrainer(AlphaZero):
         batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
 
         def single_action(env_state, key):
-            return self.predict(state.model, key, env_state, eval=True)
+            return self.predict(state.model, key, env_state)
 
         batch_predict = jax.vmap(single_action, in_axes=(0, 0))
 

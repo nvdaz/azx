@@ -8,7 +8,6 @@ import flashbax as fbx
 import haiku as hk
 import jax
 import jax.numpy as jnp
-import mctx
 import optax
 import orbax.checkpoint as ocp
 import rlax
@@ -29,8 +28,6 @@ class TrainConfig(Config):
     unroll_steps: int
     max_eval_steps: int
     avg_return_smoothing: float
-    dirichlet_alpha: float
-    dirichlet_mix: float
     checkpoint_frequency: int
     max_length_buffer: int
     min_length_buffer: int
@@ -191,7 +188,7 @@ class MuZeroTrainer(MuZero):
         r_preds = jnp.zeros((B, T), dtype=jnp.float32)
         logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
 
-        (s_last, pred_state_new, dyn_state_new, v_preds, logits_all, r_preds), _ = (
+        (_, pred_state_new, dyn_state_new, v_preds, logits_all, r_preds), _ = (
             jax.lax.scan(
                 step_fn,
                 (s0, net_state.pred, net_state.dyn, v_preds, logits_all, r_preds),
@@ -221,6 +218,8 @@ class MuZeroTrainer(MuZero):
             mask_t, logits_t, jnp.array(1e-9, dtype=logits_t.dtype)
         )
         masked_targets = pi_t * mask_t
+        masked_logits = logits_t
+        # masked_targets = pi_t
         target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
         loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
@@ -265,47 +264,6 @@ class MuZeroTrainer(MuZero):
         )(terminal, reset_states, env_states)
 
         return env_states, reward, terminal
-
-    def _muzero_search(self, state: TrainState) -> tuple[TrainState, mctx.PolicyOutput]:
-        env_obs = jax.vmap(self.obs_fn)(state.env_states)
-        key, subkey = jax.random.split(state.key)
-        latent, _ = self.rep_net.apply(
-            state.model.params.rep, state.model.state.rep, subkey, env_obs
-        )
-
-        key, subkey = jax.random.split(key)
-        (pi_logits, value), _ = self.pred_net.apply(
-            state.model.params.pred, state.model.state.pred, subkey, latent
-        )
-
-        key, subkey = jax.random.split(key)
-        noise_key, mcts_key = jax.random.split(subkey)
-
-        action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
-        masked_logits = jnp.where(action_mask, pi_logits, -jnp.inf)
-        probs = jax.nn.softmax(masked_logits)
-
-        noise = jax.random.dirichlet(
-            noise_key,
-            jnp.full(self.env.action_spec.num_values, self.config.dirichlet_alpha),
-            shape=(self.config.batch_size,),
-        )
-
-        mixed = (
-            1.0 - self.config.dirichlet_mix
-        ) * probs + self.config.dirichlet_mix * noise
-        prior_logits = jnp.where(action_mask, jnp.log(jnp.clip(mixed, 1e-12)), -jnp.inf)
-
-        policy_output = self._policy_output(
-            model=state.model,
-            key=mcts_key,
-            latent=latent,
-            pi_logits=prior_logits,
-            value=value,
-            eval=False,
-        )
-
-        return state._replace(key=key), policy_output
 
     def _compute_gradients(
         self,
@@ -362,7 +320,9 @@ class MuZeroTrainer(MuZero):
         batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
 
         def loop_fn(state: TrainState, _):
-            state, policy_output = self._muzero_search(state)
+            key, search_key, step_key = jax.random.split(state.key, 3)
+            obs = jax.vmap(self.obs_fn)(state.env_states)
+            policy_output = self._muzero_search(state.model, search_key, obs)
             raw_counts = policy_output.action_weights  # shape: [batch, num_actions]
             count_sums = jnp.sum(raw_counts, axis=-1, keepdims=True)
             count_sums = jnp.maximum(count_sums, 1.0)
@@ -370,9 +330,8 @@ class MuZeroTrainer(MuZero):
 
             obs = batch_obs(state.env_states)
             action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
-            key, subkey = jax.random.split(state.key)
             env_states, reward, terminal = self._step_env(
-                subkey, state.env_states, policy_output.action
+                step_key, state.env_states, policy_output.action
             )
 
             experience = TimeStep(
@@ -484,7 +443,7 @@ class MuZeroTrainer(MuZero):
             ev = self.evaluate(state, self.config.max_eval_steps)
 
             print(
-                f"Step {time_step} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
+                f"Step {time_step:06d} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
                 f"Pi Loss: {avg_pi_loss:.3f} | Value Loss: {avg_value_loss:.3f}",
                 flush=True,
             )

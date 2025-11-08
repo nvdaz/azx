@@ -73,15 +73,16 @@ class MuZero:
             next_latent,
         )
 
-    def _policy_output(
-        self,
-        model: ModelState,
-        key: chex.PRNGKey,
-        latent: jax.Array,
-        pi_logits: jax.Array,
-        value: jax.Array,
-        eval: bool,
+    def _muzero_search(
+        self, model: ModelState, key: chex.PRNGKey, obs: jax.Array, eval: bool = False
     ) -> mctx.PolicyOutput:
+        key, rep_key, pred_key, mcts_key = jax.random.split(key, 4)
+        latent, _ = self.rep_net.apply(model.params.rep, model.state.rep, rep_key, obs)
+
+        (pi_logits, value), _ = self.pred_net.apply(
+            model.params.pred, model.state.pred, pred_key, latent
+        )
+
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
             value=value,  # type: ignore
@@ -90,7 +91,7 @@ class MuZero:
 
         return mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=key,
+            rng_key=mcts_key,
             root=root,
             recurrent_fn=self._recurrent_fn,
             num_simulations=self.config.num_simulations,
@@ -104,31 +105,10 @@ class MuZero:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
-        self,
-        model: ModelState,
-        key: chex.PRNGKey,
-        obs: chex.ArrayTree,
-        eval: bool = False,
+        self, model: ModelState, key: chex.PRNGKey, obs: jax.Array
     ) -> jax.Array:
-        key, subkey = jax.random.split(key)
-        latent, _ = self.rep_net.apply(
-            model.params.rep,
-            model.state.rep,
-            subkey,
-            jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), obs),
-        )
-        key, subkey = jax.random.split(key)
-        (pi_logits, value), _ = self.pred_net.apply(
-            model.params.pred, model.state.pred, subkey, latent
+        policy_output = self._muzero_search(
+            model=model, key=key, obs=obs[None, ...], eval=True
         )
 
-        policy_output = self._policy_output(
-            model=model,
-            key=key,
-            latent=latent,
-            pi_logits=pi_logits,
-            value=value,
-            eval=eval,
-        )
-
-        return policy_output.action[0]  # type: ignore
+        return policy_output.action[0]

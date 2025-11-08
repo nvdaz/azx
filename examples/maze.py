@@ -18,11 +18,9 @@ config = TrainConfig(
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=200,
+    num_simulations=100,
     eval_frequency=100,
     max_eval_steps=100,
-    dirichlet_alpha=0.3,
-    dirichlet_mix=0.25,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
     max_length_buffer=64,
@@ -39,7 +37,6 @@ class MLP(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        # three blocks with LayerNorm for stable scales
         for width in (256, 256, 256):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
@@ -105,6 +102,6 @@ checkpoints_dir.mkdir(exist_ok=True)
 
 state, returns, steps = trainer.learn(
     state=state,
-    num_steps=100000,
+    num_steps=1000,
     checkpoints_dir="./checkpoints",
 )

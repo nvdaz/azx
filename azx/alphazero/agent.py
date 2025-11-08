@@ -70,25 +70,33 @@ class AlphaZero:
             env_states,
         )
 
-    def _policy_output(
+    def _alphazero_search(
         self,
         model: ModelState,
         key: chex.PRNGKey,
-        env_states: chex.ArrayTree,
-        pi_logits: jax.Array,
-        value: jax.Array,
-        eval: bool,
+        env_states: jax.Array,
+        eval: bool = False,
     ) -> mctx.PolicyOutput:
+        obs = jax.vmap(self.obs_fn)(env_states)
+        key, apply_key, mcts_key = jax.random.split(key, 3)
+        (pi_logits, value), _ = self.network.apply(
+            model.params, model.state, apply_key, obs
+        )
+        valid_actions = jax.vmap(self.action_mask_fn)(env_states)
+
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
             value=value,  # type: ignore
             embedding=env_states,  # type: ignore
         )
 
+        invalid_actions = jax.vmap(lambda valid_mask: 1 - valid_mask)(valid_actions)
+
         return mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=key,
+            rng_key=mcts_key,
             root=root,
+            invalid_actions=invalid_actions,
             recurrent_fn=self._recurrent_fn,
             num_simulations=self.config.num_simulations,
             max_num_considered_actions=self.env.action_spec.num_values,
@@ -102,26 +110,12 @@ class AlphaZero:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
-        self,
-        model: ModelState,
-        key: chex.PRNGKey,
-        env_state: chex.ArrayTree,
-        eval: bool = False,
+        self, model: ModelState, key: chex.PRNGKey, env_state: chex.ArrayTree
     ) -> jax.Array:
-        key, subkey = jax.random.split(key)
-        (pi_logits, value), _ = self.network.apply(
-            model.params, model.state, subkey, self.obs_fn(env_state)[None, ...]
-        )  # ignore new state for inference
-        mask = self.action_mask_fn(env_state)
-        pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
+        env_states = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state)
 
-        policy_output = self._policy_output(
-            model=model,
-            key=key,
-            env_states=jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state),
-            pi_logits=pi_logits,
-            value=value,
-            eval=eval,
+        policy_output = self._alphazero_search(
+            model=model, key=key, env_states=env_states, eval=True
         )
 
-        return policy_output.action[0]  # type: ignore
+        return policy_output.action[0]
