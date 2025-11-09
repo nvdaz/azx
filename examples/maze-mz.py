@@ -59,7 +59,7 @@ class RepresentationModel(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        for width in (256, 256, 256):
+        for width in (64, 64, 64):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -78,7 +78,7 @@ class DynamicsModel(hk.Module):
         action = action.astype(jnp.int32)
         action_oh = jax.nn.one_hot(action, self.action_dim)
         x = jnp.concatenate([latent, action_oh], axis=-1)  # (B, L + A)
-        for width in (256, 256, 256):
+        for width in (64, 64, 64):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -90,13 +90,13 @@ class DynamicsModel(hk.Module):
         reward = hk.Linear(128)(x)
         reward = jax.nn.silu(reward)
         reward = jnp.squeeze(hk.Linear(1)(reward), -1)  # (B,)
+        reward = jax.nn.tanh(reward)
 
         terminal = hk.Linear(128)(x)
         terminal = jax.nn.silu(terminal)
         terminal = jnp.squeeze(hk.Linear(1)(terminal), -1)  # (B,)
+        terminal = jax.nn.sigmoid(terminal)
 
-        reward = jax.nn.tanh(reward)
-        terminal = jax.nn.tanh(terminal)
 
         return next_latent, reward, terminal
 
@@ -107,7 +107,7 @@ class PredictionModel(hk.Module):
         self.action_dim = action_dim
 
     def __call__(self, x):
-        for width in (256, 256, 256):
+        for width in (64, 64, 64):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)

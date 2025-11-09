@@ -354,9 +354,9 @@ class MuZeroTrainer(MuZero):
         def loop_fn(carry):
             env_states, reward_acc, done_mask, key, iter = carry
             key, subkey = jax.random.split(key)
-            obs = jax.vmap(self.obs_fn)(state.env_states)
+            obs = jax.vmap(self.obs_fn)(env_states)
 
-            valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
+            valid_actions = jax.vmap(self.action_mask_fn)(env_states)
             policy_output = self._muzero_search(
                 state.model, subkey, obs, valid_actions, eval=True
             )
