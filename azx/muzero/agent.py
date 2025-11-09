@@ -74,7 +74,12 @@ class MuZero:
         )
 
     def _muzero_search(
-        self, model: ModelState, key: chex.PRNGKey, obs: jax.Array, eval: bool = False
+        self,
+        model: ModelState,
+        key: chex.PRNGKey,
+        obs: jax.Array,
+        valid_actions: jax.Array,
+        eval: bool = False,
     ) -> mctx.PolicyOutput:
         key, rep_key, pred_key, mcts_key = jax.random.split(key, 4)
         latent, _ = self.rep_net.apply(model.params.rep, model.state.rep, rep_key, obs)
@@ -88,11 +93,13 @@ class MuZero:
             value=value,  # type: ignore
             embedding=latent,  # type: ignore
         )
+        invalid_actions = jax.vmap(lambda valid_mask: 1 - valid_mask)(valid_actions)
 
         return mctx.gumbel_muzero_policy(
             params=model,
             rng_key=mcts_key,
             root=root,
+            invalid_actions=invalid_actions,
             recurrent_fn=self._recurrent_fn,
             num_simulations=self.config.num_simulations,
             qtransform=functools.partial(
@@ -105,10 +112,18 @@ class MuZero:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
-        self, model: ModelState, key: chex.PRNGKey, obs: jax.Array
+        self,
+        model: ModelState,
+        key: chex.PRNGKey,
+        obs: jax.Array,
+        valid_actions: jax.Array,
     ) -> jax.Array:
         policy_output = self._muzero_search(
-            model=model, key=key, obs=obs[None, ...], eval=True
+            model=model,
+            key=key,
+            obs=obs[None, ...],
+            valid_actions=valid_actions,
+            eval=True,
         )
 
         return policy_output.action[0]

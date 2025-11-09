@@ -109,9 +109,9 @@ class AlphaZeroTrainer(AlphaZero):
             buffer_state=buffer_state,
             opt_state=opt_state,
             avg_return=jnp.zeros(self.config.batch_size),
-            avg_loss=0.0,
-            avg_pi_loss=0.0,
-            avg_value_loss=0.0,
+            avg_loss=jnp.zeros(self.config.batch_size),
+            avg_pi_loss=jnp.zeros(self.config.batch_size),
+            avg_value_loss=jnp.zeros(self.config.batch_size),
             episode_return=jnp.zeros(self.config.batch_size),
             num_episodes=jnp.zeros(self.config.batch_size),
             eval_avg_return=jnp.zeros(self.config.batch_size),
@@ -167,9 +167,7 @@ class AlphaZeroTrainer(AlphaZero):
         nstep_fn = functools.partial(
             rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
         )
-        z_targets = jax.vmap(nstep_fn, in_axes=(0, 0, 0), out_axes=0)(
-            rewards, discounts, value_seq
-        )
+        z_targets = jax.vmap(nstep_fn)(rewards, discounts, value_seq)
 
         z_t = z_targets[:, :K]
         v_t = v_preds[:, :K]
@@ -199,17 +197,12 @@ class AlphaZeroTrainer(AlphaZero):
     def _step_env(
         self, key: chex.PRNGKey, env_states: chex.ArrayTree, actions: jax.Array
     ) -> tuple[chex.ArrayTree, jax.Array, jax.Array]:
-        batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
-        batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
-        batch_reward = jax.vmap(lambda x: x.reward, in_axes=(0,))
-        batch_terminal = jax.vmap(lambda x: x.last(), in_axes=(0,))
-
-        env_states, steps = batch_step(env_states, actions)
-        reward = batch_reward(steps)
-        terminal = batch_terminal(steps)
+        env_states, steps = jax.vmap(self.env.step)(env_states, actions)
+        reward = jax.vmap(lambda x: x.reward)(steps)
+        terminal = jax.vmap(lambda x: x.last())(steps)
 
         subkeys = jax.random.split(key, self.config.batch_size)
-        reset_states, _ = batch_reset(subkeys)
+        reset_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         env_states = jax.vmap(
             lambda t, reset_state, env_state: jax.lax.cond(
@@ -254,34 +247,27 @@ class AlphaZeroTrainer(AlphaZero):
 
     @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def train_step(self, state: TrainState) -> TrainState:
-        batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
-
         def loop_fn(state: TrainState, _):
             key, search_key, step_key = jax.random.split(state.key, 3)
+            obs = jax.vmap(self.obs_fn)(state.env_states)
+            valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
+
             policy_output = self._alphazero_search(
                 model=state.model,
                 key=search_key,
                 env_states=state.env_states,
                 eval=False,
             )
-
-            raw_counts = policy_output.action_weights  # (B, A)
-            count_sums = jnp.maximum(jnp.sum(raw_counts, axis=-1, keepdims=True), 1.0)
-            pi_target = raw_counts / count_sums
-
-            obs = batch_obs(state.env_states)
-            action_mask = jax.vmap(self.action_mask_fn)(state.env_states)
-
             env_states, reward, terminal = self._step_env(
                 step_key, state.env_states, policy_output.action
             )
 
             experience = TimeStep(
-                obs=obs.astype(jnp.float32)[:, None, ...],
+                obs=obs[:, None, ...],
                 reward=reward[:, None, ...],
                 terminal=terminal[:, None, ...],
-                pi=pi_target[:, None, ...],
-                action_mask=action_mask.astype(jnp.bool_)[:, None, ...],
+                pi=policy_output.action_weights[:, None, ...],
+                action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
             )
             buffer_state = self.buffer.add(state.buffer_state, experience)
 
@@ -318,25 +304,19 @@ class AlphaZeroTrainer(AlphaZero):
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
-        batch_reset = jax.vmap(self.env.reset, in_axes=(0,))
-        batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
-
-        def single_action(env_state, key):
-            return self.predict(state.model, key, env_state)
-
-        batch_predict = jax.vmap(single_action, in_axes=(0, 0))
-
         def loop_fn(carry):
             env_states, reward_acc, done_mask, key, iter = carry
             key, subkey = jax.random.split(key)
-            step_keys = jax.random.split(subkey, self.config.batch_size)
 
-            actions = batch_predict(env_states, step_keys)
+            policy_output = self._alphazero_search(
+                state.model, subkey, env_states, eval=True
+            )
+            action = policy_output.action
 
             # step the envs
-            next_states, steps = batch_step(env_states, actions)
-            r = jax.vmap(lambda ts: ts.reward, in_axes=(0,))(steps)
-            done = jax.vmap(lambda ts: ts.last(), in_axes=(0,))(steps)
+            next_states, steps = jax.vmap(self.env.step)(env_states, action)
+            r = jax.vmap(lambda ts: ts.reward)(steps)
+            done = jax.vmap(lambda ts: ts.last())(steps)
 
             # accumulate only for unfinished envs
             reward_acc = jnp.where(done_mask, reward_acc, reward_acc + r)
@@ -346,7 +326,7 @@ class AlphaZeroTrainer(AlphaZero):
 
         key, subkey = jax.random.split(state.key)
         reset_keys = jax.random.split(subkey, self.config.batch_size)
-        env_states, _ = batch_reset(reset_keys)
+        env_states, _ = jax.vmap(self.env.reset)(reset_keys)
 
         reward_acc = jnp.zeros(self.config.batch_size)
         done_mask = jnp.zeros(self.config.batch_size, dtype=jnp.bool_)
