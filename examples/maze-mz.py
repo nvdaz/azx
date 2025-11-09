@@ -92,13 +92,7 @@ class DynamicsModel(hk.Module):
         reward = jnp.squeeze(hk.Linear(1)(reward), -1)  # (B,)
         reward = jax.nn.tanh(reward)
 
-        terminal = hk.Linear(128)(x)
-        terminal = jax.nn.silu(terminal)
-        terminal = jnp.squeeze(hk.Linear(1)(terminal), -1)  # (B,)
-        terminal = jax.nn.sigmoid(terminal)
-
-
-        return next_latent, reward, terminal
+        return next_latent, reward
 
 
 class PredictionModel(hk.Module):

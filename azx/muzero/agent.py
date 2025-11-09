@@ -56,7 +56,7 @@ class MuZero:
         latent_states: jax.Array,
     ):
         key, subkey = jax.random.split(key)
-        (next_latent, reward, terminal_prob), _ = self.dyn_net.apply(
+        (next_latent, reward), _ = self.dyn_net.apply(
             model.params.dyn, model.state.dyn, subkey, latent_states, actions
         )
         (pi_logits, value), _ = self.pred_net.apply(
@@ -66,7 +66,7 @@ class MuZero:
         return (
             mctx.RecurrentFnOutput(
                 reward=reward,  # type: ignore
-                discount=self.config.discount * (1.0 - terminal_prob), # type: ignore
+                discount=jnp.full((self.config.batch_size,), self.config.discount),  # type: ignore
                 prior_logits=pi_logits,  # type: ignore
                 value=value,  # type: ignore
             ),

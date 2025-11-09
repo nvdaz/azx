@@ -173,7 +173,7 @@ class MuZeroTrainer(MuZero):
             (logits, v), pred_st = self.pred_net.apply(params.pred, pred_st, key, s)
             s_scaled = 0.5 * s + 0.5 * jax.lax.stop_gradient(s)  # multiply grads by 0.5
 
-            (s_next, r_pred, _), dyn_st = self.dyn_net.apply(
+            (s_next, r_pred), dyn_st = self.dyn_net.apply(
                 params.dyn, dyn_st, key, s_scaled, actions[:, t]
             )
 
