@@ -8,6 +8,8 @@ import jax
 import jax.numpy as jnp
 import mctx
 
+from azx.internal.support import DiscreteSupport
+
 
 @dataclasses.dataclass
 class Config:
@@ -47,6 +49,7 @@ class MuZero:
         self.rep_net = hk.transform_with_state(representation_fn)
         self.dyn_net = hk.transform_with_state(dynamics_fn)
         self.pred_net = hk.transform_with_state(prediction_fn)
+        self.support = DiscreteSupport()
 
     def _recurrent_fn(
         self,
@@ -59,9 +62,10 @@ class MuZero:
         (next_latent, reward), _ = self.dyn_net.apply(
             model.params.dyn, model.state.dyn, subkey, latent_states, actions
         )
-        (pi_logits, value), _ = self.pred_net.apply(
+        (pi_logits, value_logits), _ = self.pred_net.apply(
             model.params.pred, model.state.pred, key, next_latent
         )
+        value = self.support.decode_logits(value_logits)
 
         return (
             mctx.RecurrentFnOutput(
@@ -84,9 +88,10 @@ class MuZero:
         key, rep_key, pred_key, mcts_key = jax.random.split(key, 4)
         latent, _ = self.rep_net.apply(model.params.rep, model.state.rep, rep_key, obs)
 
-        (pi_logits, value), _ = self.pred_net.apply(
+        (pi_logits, value_logits), _ = self.pred_net.apply(
             model.params.pred, model.state.pred, pred_key, latent
         )
+        value = self.support.decode_logits(value_logits)
 
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore

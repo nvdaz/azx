@@ -18,13 +18,13 @@ config = TrainConfig(
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=100,
-    eval_frequency=100,
+    num_simulations=50,
+    eval_frequency=1000,
     max_eval_steps=100,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
-    max_length_buffer=64,
-    min_length_buffer=24,
+    max_length_buffer=8192,
+    min_length_buffer=64,
 )
 
 
@@ -107,9 +107,7 @@ class PredictionModel(hk.Module):
             x = jax.nn.silu(x)
 
         v = hk.Linear(128)(x)
-        v = jax.nn.silu(v)
-        v = hk.Linear(1)(v)
-        value = jnp.tanh(v[..., 0])
+        value = hk.Linear(601)(v)
 
         pi_logits = hk.Linear(128)(x)
         pi_logits = hk.Linear(self.action_dim)(pi_logits)  # (B, A)

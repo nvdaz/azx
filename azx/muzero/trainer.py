@@ -166,39 +166,64 @@ class MuZeroTrainer(MuZero):
             params.rep, net_state.rep, rep_key, obs[:, 0]
         )
 
+        B = self.config.batch_size
+        A = self.env.action_spec.num_values
+        S = self.support.size
+
+        v_values = jnp.zeros((B, T), dtype=jnp.float32)
+        v_logits_all = jnp.zeros((B, T, S), dtype=jnp.float32)
+        r_preds = jnp.zeros((B, T), dtype=jnp.float32)
+        logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
+
         def step_fn(carry, t):
-            s, pred_st, dyn_st, v_acc, log_acc, r_acc = carry
+            s, pred_st, dyn_st, v_vals, v_logs, log_acc, r_acc = carry
             key = step_keys[t]
 
-            (logits, v), pred_st = self.pred_net.apply(params.pred, pred_st, key, s)
-            s_scaled = 0.5 * s + 0.5 * jax.lax.stop_gradient(s)  # multiply grads by 0.5
+            (pi_logits, v_logits), pred_st = self.pred_net.apply(
+                params.pred, pred_st, key, s
+            )
+            v_scalar = self.support.decode_logits(v_logits)
+
+            s_scaled = 0.5 * s + 0.5 * jax.lax.stop_gradient(s)
 
             (s_next, r_pred), dyn_st = self.dyn_net.apply(
                 params.dyn, dyn_st, key, s_scaled, actions[:, t]
             )
 
-            v_acc = v_acc.at[:, t].set(v)
+            v_vals = v_vals.at[:, t].set(v_scalar)
+            v_logs = v_logs.at[:, t, :].set(v_logits)
             r_acc = r_acc.at[:, t].set(r_pred)
-            log_acc = log_acc.at[:, t, :].set(logits)
+            log_acc = log_acc.at[:, t, :].set(pi_logits)
 
-            return (s_next, pred_st, dyn_st, v_acc, log_acc, r_acc), None
+            return (s_next, pred_st, dyn_st, v_vals, v_logs, log_acc, r_acc), None
 
-        B = self.config.batch_size
-        A = self.env.action_spec.num_values
-        v_preds = jnp.zeros((B, T), dtype=jnp.float32)
-        r_preds = jnp.zeros((B, T), dtype=jnp.float32)
-        logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
-
-        (_, pred_state_new, dyn_state_new, v_preds, logits_all, r_preds), _ = (
-            jax.lax.scan(
-                step_fn,
-                (s0, net_state.pred, net_state.dyn, v_preds, logits_all, r_preds),
-                jnp.arange(T),
-            )
+        (
+            (
+                _,
+                pred_state_new,
+                dyn_state_new,
+                v_values,
+                v_logits_all,
+                logits_all,
+                r_preds,
+            ),
+            _,
+        ) = jax.lax.scan(
+            step_fn,
+            (
+                s0,
+                net_state.pred,
+                net_state.dyn,
+                v_values,
+                v_logits_all,
+                logits_all,
+                r_preds,
+            ),
+            jnp.arange(T),
         )
 
         value_seq = jnp.zeros_like(rewards)
-        value_seq = value_seq.at[:, n : n + K].set(v_preds[:, n : n + K])
+        value_seq = value_seq.at[:, n : n + K].set(v_values[:, n : n + K])
 
         nstep_fn = functools.partial(
             rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
@@ -206,13 +231,12 @@ class MuZeroTrainer(MuZero):
         z_targets = jax.vmap(nstep_fn)(rewards, discounts, value_seq)
 
         z_t = z_targets[:, :K]
-        v_t = v_preds[:, :K]
+        v_logits_t = v_logits_all[:, :K]  # (B, K, S)
         r_t = r_preds[:, :K]
         r_true = rewards[:, :K]
         logits_t = logits_all[:, :K]
         pi_t = target_pi[:, :K]
         mask_t = action_mask[:, :K]
-        row_ok = mask_t.any(axis=-1, keepdims=True)
 
         masked_logits = jnp.where(
             mask_t, logits_t, jnp.array(-1e9, dtype=logits_t.dtype)
@@ -220,9 +244,10 @@ class MuZeroTrainer(MuZero):
         masked_targets = pi_t * mask_t
         target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
+        v_prob = self.support.encode(z_t)  # (B, K, S)
+
         loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
-        loss_pi = jnp.where(row_ok[:, :, 0], loss_pi, jnp.full_like(loss_pi, 0)).mean()
-        loss_v = optax.squared_error(v_t, z_t).mean()
+        loss_v = optax.softmax_cross_entropy(v_logits_t, v_prob).mean()
         loss_r = optax.squared_error(r_t, r_true).mean()
 
         total_loss = loss_pi + 0.5 * loss_v + 0.5 * loss_r
