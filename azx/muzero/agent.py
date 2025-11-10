@@ -59,9 +59,10 @@ class MuZero:
         latent_states: jax.Array,
     ):
         key, subkey = jax.random.split(key)
-        (next_latent, reward), _ = self.dyn_net.apply(
+        (next_latent, reward_logits), _ = self.dyn_net.apply(
             model.params.dyn, model.state.dyn, subkey, latent_states, actions
         )
+        reward = self.support.decode_logits(reward_logits)
         (pi_logits, value_logits), _ = self.pred_net.apply(
             model.params.pred, model.state.pred, key, next_latent
         )

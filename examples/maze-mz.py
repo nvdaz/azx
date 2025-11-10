@@ -88,9 +88,7 @@ class DynamicsModel(hk.Module):
         next_latent = hk.Linear(self.latent_dim)(next_latent)  # (B, L)
 
         reward = hk.Linear(128)(x)
-        reward = jax.nn.silu(reward)
-        reward = jnp.squeeze(hk.Linear(1)(reward), -1)  # (B,)
-        reward = jax.nn.tanh(reward)
+        reward = hk.Linear(601)(x)
 
         return next_latent, reward
 

@@ -172,11 +172,12 @@ class MuZeroTrainer(MuZero):
 
         v_values = jnp.zeros((B, T), dtype=jnp.float32)
         v_logits_all = jnp.zeros((B, T, S), dtype=jnp.float32)
-        r_preds = jnp.zeros((B, T), dtype=jnp.float32)
+        r_values = jnp.zeros((B, T), dtype=jnp.float32)
+        r_logits_all = jnp.zeros((B, T, S), dtype=jnp.float32)
         logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
 
         def step_fn(carry, t):
-            s, pred_st, dyn_st, v_vals, v_logs, log_acc, r_acc = carry
+            s, pred_st, dyn_st, v_vals, v_logs, log_acc, r_vals, r_logs = carry
             key = step_keys[t]
 
             (pi_logits, v_logits), pred_st = self.pred_net.apply(
@@ -185,17 +186,27 @@ class MuZeroTrainer(MuZero):
             v_scalar = self.support.decode_logits(v_logits)
 
             s_scaled = 0.5 * s + 0.5 * jax.lax.stop_gradient(s)
-
-            (s_next, r_pred), dyn_st = self.dyn_net.apply(
+            (s_next, r_logits), dyn_st = self.dyn_net.apply(
                 params.dyn, dyn_st, key, s_scaled, actions[:, t]
             )
+            r_scalar = self.support.decode_logits(r_logits)
 
             v_vals = v_vals.at[:, t].set(v_scalar)
             v_logs = v_logs.at[:, t, :].set(v_logits)
-            r_acc = r_acc.at[:, t].set(r_pred)
+            r_vals = r_vals.at[:, t].set(r_scalar)
+            r_logs = r_logs.at[:, t].set(r_logits)
             log_acc = log_acc.at[:, t, :].set(pi_logits)
 
-            return (s_next, pred_st, dyn_st, v_vals, v_logs, log_acc, r_acc), None
+            return (
+                s_next,
+                pred_st,
+                dyn_st,
+                v_vals,
+                v_logs,
+                log_acc,
+                r_vals,
+                r_logs,
+            ), None
 
         (
             (
@@ -205,7 +216,8 @@ class MuZeroTrainer(MuZero):
                 v_values,
                 v_logits_all,
                 logits_all,
-                r_preds,
+                r_values,
+                r_logits_all,
             ),
             _,
         ) = jax.lax.scan(
@@ -217,7 +229,8 @@ class MuZeroTrainer(MuZero):
                 v_values,
                 v_logits_all,
                 logits_all,
-                r_preds,
+                r_values,
+                r_logits_all,
             ),
             jnp.arange(T),
         )
@@ -232,7 +245,7 @@ class MuZeroTrainer(MuZero):
 
         z_t = z_targets[:, :K]
         v_logits_t = v_logits_all[:, :K]  # (B, K, S)
-        r_t = r_preds[:, :K]
+        r_logits_t = r_logits_all[:, :K]
         r_true = rewards[:, :K]
         logits_t = logits_all[:, :K]
         pi_t = target_pi[:, :K]
@@ -245,10 +258,11 @@ class MuZeroTrainer(MuZero):
         target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
         v_prob = self.support.encode(z_t)  # (B, K, S)
+        r_prob = self.support.encode(r_true)
 
         loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
         loss_v = optax.softmax_cross_entropy(v_logits_t, v_prob).mean()
-        loss_r = optax.squared_error(r_t, r_true).mean()
+        loss_r = optax.softmax_cross_entropy(r_logits_t, r_prob).mean()
 
         total_loss = loss_pi + 0.5 * loss_v + 0.5 * loss_r
 
