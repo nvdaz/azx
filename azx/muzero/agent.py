@@ -18,6 +18,9 @@ class Config:
     use_mixed_value: bool
     value_scale: float
     gumbel_scale: float
+    support_min: int 
+    support_max: int
+    support_eps: float 
 
 
 class ModelParams(NamedTuple):
@@ -49,7 +52,11 @@ class MuZero:
         self.rep_net = hk.transform_with_state(representation_fn)
         self.dyn_net = hk.transform_with_state(dynamics_fn)
         self.pred_net = hk.transform_with_state(prediction_fn)
-        self.support = DiscreteSupport()
+        self.support = DiscreteSupport(
+            min_val=config.support_min,
+            max_val=config.support_max,
+            eps=config.support_eps,
+        )
 
     def _recurrent_fn(
         self,

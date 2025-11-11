@@ -25,6 +25,9 @@ config = TrainConfig(
     gumbel_scale=0.5,
     max_length_buffer=8192,
     min_length_buffer=64,
+    support_min=0,
+    support_max=1,
+    support_eps=0.001,
 )
 
 

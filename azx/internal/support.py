@@ -12,9 +12,7 @@ class DiscreteSupport:
         self.max_val = max_val
         self.size = max_val - min_val + 1
 
-        self._bucket_values = jnp.asarray(
-            list(range(min_val, max_val + 1)), dtype=jnp.float32
-        )
+        self._bucket_values = jnp.arange(min_val, max_val + 1).astype(jnp.float32)
 
     def _scale(self, x: jax.Array) -> jax.Array:
         return jnp.sign(x) * (jnp.sqrt(jnp.abs(x) + 1) - 1 + self.eps * x)
