@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import mctx
 from jumanji.env import Environment
 
+from azx.internal.support import DiscreteSupport
+
 
 @dataclasses.dataclass
 class Config:
@@ -17,6 +19,9 @@ class Config:
     use_mixed_value: bool
     value_scale: float
     gumbel_scale: float
+    support_min: int
+    support_max: int
+    support_eps: float
 
 
 class ModelState(NamedTuple):
@@ -38,6 +43,11 @@ class AlphaZero:
         self.network = hk.transform_with_state(network_fn)
         self.obs_fn = obs_fn
         self.action_mask_fn = action_mask_fn
+        self.support = DiscreteSupport(
+            min_val=config.support_min,
+            max_val=config.support_max,
+            eps=config.support_eps,
+        )
 
     def _recurrent_fn(
         self,
@@ -46,19 +56,17 @@ class AlphaZero:
         actions: jax.Array,
         env_states: jax.Array,
     ):
-        batch_step = jax.vmap(self.env.step, in_axes=(0, 0))
-        batch_obs = jax.vmap(self.obs_fn, in_axes=(0,))
-        batch_rewards = jax.vmap(lambda x: x.reward, in_axes=(0,))
-        batch_terminals = jax.vmap(lambda x: x.last(), in_axes=(0,))
+        env_states, steps = jax.vmap(self.env.step)(env_states, actions)
+        obs = jax.vmap(self.obs_fn)(env_states)
+        rewards = jax.vmap(lambda x: x.reward)(steps)
+        terminals = jax.vmap(lambda x: x.last())(steps)
 
-        env_states, steps = batch_step(env_states, actions)
-        obs = batch_obs(env_states)
-        rewards = batch_rewards(steps)
-        terminals = batch_terminals(steps)
-
-        (pi_logits, value), _ = self.network.apply(model.params, model.state, key, obs)
+        (pi_logits, value_logits), _ = self.network.apply(
+            model.params, model.state, key, obs
+        )
         mask = jax.vmap(self.action_mask_fn)(env_states)
         pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
+        value = self.support.decode_logits(value_logits)
 
         return (
             mctx.RecurrentFnOutput(
@@ -79,10 +87,11 @@ class AlphaZero:
     ) -> mctx.PolicyOutput:
         obs = jax.vmap(self.obs_fn)(env_states)
         key, apply_key, mcts_key = jax.random.split(key, 3)
-        (pi_logits, value), _ = self.network.apply(
+        (pi_logits, value_logits), _ = self.network.apply(
             model.params, model.state, apply_key, obs
         )
         valid_actions = jax.vmap(self.action_mask_fn)(env_states)
+        value = self.support.decode_logits(value_logits)
 
         root = mctx.RootFnOutput(
             prior_logits=pi_logits,  # type: ignore
@@ -90,7 +99,7 @@ class AlphaZero:
             embedding=env_states,  # type: ignore
         )
 
-        invalid_actions = jax.vmap(lambda valid_mask: 1 - valid_mask)(valid_actions)
+        invalid_actions = 1 - valid_actions
 
         return mctx.gumbel_muzero_policy(
             params=model,

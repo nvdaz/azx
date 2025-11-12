@@ -91,7 +91,7 @@ class DynamicsModel(hk.Module):
         next_latent = hk.Linear(self.latent_dim)(next_latent)  # (B, L)
 
         reward = hk.Linear(128)(x)
-        reward = hk.Linear(601)(x)
+        reward = hk.Linear(2)(x)
 
         return next_latent, reward
 
@@ -108,7 +108,7 @@ class PredictionModel(hk.Module):
             x = jax.nn.silu(x)
 
         v = hk.Linear(128)(x)
-        value = hk.Linear(601)(v)
+        value = hk.Linear(2)(v)
 
         pi_logits = hk.Linear(128)(x)
         pi_logits = hk.Linear(self.action_dim)(pi_logits)  # (B, A)

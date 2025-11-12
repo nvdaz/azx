@@ -25,6 +25,9 @@ config = TrainConfig(
     gumbel_scale=0.5,
     max_length_buffer=64,
     min_length_buffer=24,
+    support_min=0,
+    support_max=1,
+    support_eps=0.001,
 )
 
 
@@ -47,10 +50,9 @@ class MLP(hk.Module):
 
         v = hk.Linear(128)(x)
         v = self.act(v)
-        v = hk.Linear(1, w_init=self.head_init)(v)
-        value = jnp.tanh(v[..., 0])
+        v = hk.Linear(2)(v)
 
-        return pi_logits, value
+        return pi_logits, v
 
 
 def flatten_observation(obs: State) -> jnp.ndarray:

@@ -106,7 +106,7 @@ class MuZero:
             value=value,  # type: ignore
             embedding=latent,  # type: ignore
         )
-        invalid_actions = jax.vmap(lambda valid_mask: 1 - valid_mask)(valid_actions)
+        invalid_actions = 1 - valid_actions
 
         return mctx.gumbel_muzero_policy(
             params=model,

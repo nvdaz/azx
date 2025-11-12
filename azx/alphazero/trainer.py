@@ -139,25 +139,28 @@ class AlphaZeroTrainer(AlphaZero):
         action_mask = batch.experience.action_mask
 
         def step_fn(carry, t):
-            pred_st, v_acc, log_acc = carry
+            pred_st, v_acc, v_log_acc, log_acc = carry
             key = step_keys[t]
 
             obs = s0[:, t]
-            (logits, v), pred_st = self.network.apply(params, pred_st, key, obs)
+            (logits, v_logits), pred_st = self.network.apply(params, pred_st, key, obs)
 
-            v_acc = v_acc.at[:, t].set(v)
+            v_acc = v_acc.at[:, t].set(self.support.decode(v_logits))
+            v_log_acc = v_log_acc.at[:, t].set(v_logits)
             log_acc = log_acc.at[:, t, :].set(logits)
 
-            return (pred_st, v_acc, log_acc), None
+            return (pred_st, v_acc, v_log_acc, log_acc), None
 
         B = self.config.batch_size
         A = self.env.action_spec.num_values
+        S = self.support.size
         v_preds = jnp.zeros((B, T), dtype=jnp.float32)
+        v_log = jnp.zeros((B, T, S), dtype=jnp.float32)
         logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
 
-        (pred_state_new, v_preds, logits_all), _ = jax.lax.scan(
+        (pred_state_new, v_preds, v_log, logits_all), _ = jax.lax.scan(
             step_fn,
-            (net_state, v_preds, logits_all),
+            (net_state, v_preds, v_log, logits_all),
             jnp.arange(T),
         )
 
@@ -170,11 +173,11 @@ class AlphaZeroTrainer(AlphaZero):
         z_targets = jax.vmap(nstep_fn)(rewards, discounts, value_seq)
 
         z_t = z_targets[:, :K]
+        v_logits_t = v_log[:, :K]  # (B, K, S)
         v_t = v_preds[:, :K]
         logits_t = logits_all[:, :K]
         pi_t = target_pi[:, :K]
         mask_t = action_mask[:, :K]
-        row_ok = mask_t.any(axis=-1, keepdims=True)
 
         masked_logits = jnp.where(
             mask_t, logits_t, jnp.array(-1e9, dtype=logits_t.dtype)
@@ -182,9 +185,10 @@ class AlphaZeroTrainer(AlphaZero):
         masked_targets = pi_t * mask_t
         target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
-        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm)
-        loss_pi = jnp.where(row_ok[:, :, 0], loss_pi, jnp.full_like(loss_pi, 0)).mean()
-        loss_v = optax.squared_error(v_t, z_t).mean()
+        v_prob = self.support.encode(z_t)
+
+        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
+        loss_v = optax.softmax_cross_entropy(v_logits_t, v_prob).mean()
 
         total_loss = loss_pi + 0.5 * loss_v
 
