@@ -7,8 +7,8 @@ import optax
 from jumanji.environments.routing.maze.env import Maze
 from jumanji.environments.routing.maze.generator import RandomGenerator
 from jumanji.environments.routing.maze.types import State
-from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
 
+from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
 
 config = TrainConfig(
     discount=0.99,
@@ -18,15 +18,16 @@ config = TrainConfig(
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=5,
+    num_simulations=100,
     eval_frequency=100,
     max_eval_steps=100,
-    dirichlet_alpha=0.3,
-    dirichlet_mix=0.25,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
     max_length_buffer=64,
     min_length_buffer=24,
+    support_min=0,
+    support_max=1,
+    support_eps=0.001,
 )
 
 
@@ -39,7 +40,6 @@ class MLP(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        # three blocks with LayerNorm for stable scales
         for width in (256, 256, 256):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
@@ -50,10 +50,9 @@ class MLP(hk.Module):
 
         v = hk.Linear(128)(x)
         v = self.act(v)
-        v = hk.Linear(1, w_init=self.head_init)(v)
-        value = jnp.tanh(v[..., 0])  
+        v = hk.Linear(2)(v)
 
-        return pi_logits, value
+        return pi_logits, v
 
 
 def flatten_observation(obs: State) -> jnp.ndarray:
@@ -105,6 +104,6 @@ checkpoints_dir.mkdir(exist_ok=True)
 
 state, returns, steps = trainer.learn(
     state=state,
-    num_steps=100000,
+    num_steps=1000,
     checkpoints_dir="./checkpoints",
 )
