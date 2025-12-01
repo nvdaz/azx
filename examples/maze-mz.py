@@ -14,13 +14,13 @@ config = TrainConfig(
     discount=0.99,
     use_mixed_value=True,
     value_scale=1.0,
-    actor_batch_size=256,
-    train_batch_size=32,
+    actor_batch_size=128,
+    train_batch_size=64,
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=50,
-    eval_frequency=100,
+    num_simulations=5,
+    eval_frequency=1000,
     max_eval_steps=100,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
@@ -63,12 +63,12 @@ class RepresentationModel(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        for width in (128, 128, 128):
+        for width in (256, 256, 256, 256, 256):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
 
-        return hk.Linear(latent_dim)(x)  # (B, L)
+        return hk.Linear(self.latent_dim)(x)  # (B, L)
 
 
 class DynamicsModel(hk.Module):
@@ -82,7 +82,7 @@ class DynamicsModel(hk.Module):
         action = action.astype(jnp.int32)
         action_oh = jax.nn.one_hot(action, self.action_dim)
         x = jnp.concatenate([latent, action_oh], axis=-1)  # (B, L + A)
-        for width in (128, 128, 128):
+        for width in (256, 256, 256):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -104,7 +104,7 @@ class PredictionModel(hk.Module):
         self.action_dim = action_dim
 
     def __call__(self, x):
-        for width in (64, 64, 64):
+        for width in (128, 128, 128):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -119,7 +119,7 @@ class PredictionModel(hk.Module):
 
 env = Maze(RandomGenerator(5, 5))
 action_dim = env.action_spec.num_values
-latent_dim = 128
+latent_dim = 256
 
 
 def action_mask_fn(state):
