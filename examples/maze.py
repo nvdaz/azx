@@ -46,7 +46,7 @@ class MLP(hk.Module):
             x = self.act(x)
 
         # policy head (logits)
-        pi_logits = hk.Linear(self.num_actions, w_init=self.head_init)(x)  # [B, A]
+        pi_logits = hk.Linear(self.num_actions, w_init=self.head_init)(x)  # (B, A)
 
         v = hk.Linear(128)(x)
         v = self.act(v)

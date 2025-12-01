@@ -18,9 +18,9 @@ class Config:
     use_mixed_value: bool
     value_scale: float
     gumbel_scale: float
-    support_min: int 
+    support_min: int
     support_max: int
-    support_eps: float 
+    support_eps: float
 
 
 class ModelParams(NamedTuple):
@@ -78,7 +78,7 @@ class MuZero:
         return (
             mctx.RecurrentFnOutput(
                 reward=reward,  # type: ignore
-                discount=jnp.full((self.config.batch_size,), self.config.discount),  # type: ignore
+                discount=jnp.full_like(reward, self.config.discount),  # type: ignore
                 prior_logits=pi_logits,  # type: ignore
                 value=value,  # type: ignore
             ),

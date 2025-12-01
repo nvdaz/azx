@@ -21,7 +21,8 @@ from .agent import Config, ModelNetState, ModelParams, ModelState, MuZero
 
 @dataclasses.dataclass
 class TrainConfig(Config):
-    batch_size: int
+    actor_batch_size: int
+    train_batch_size: int
     eval_frequency: int
     n_step: int
     unroll_steps: int
@@ -81,8 +82,8 @@ class MuZeroTrainer(MuZero):
         self.buffer = fbx.make_trajectory_buffer(
             max_length_time_axis=config.max_length_buffer,
             min_length_time_axis=config.min_length_buffer,
-            sample_batch_size=config.batch_size,
-            add_batch_size=config.batch_size,
+            sample_batch_size=config.train_batch_size,
+            add_batch_size=config.actor_batch_size,
             sample_sequence_length=config.n_step + config.unroll_steps,
             period=1,
         )
@@ -122,7 +123,7 @@ class MuZeroTrainer(MuZero):
         opt_state = self.opt.init(params)
 
         key, subkey = jax.random.split(key)
-        subkeys = jax.random.split(subkey, self.config.batch_size)
+        subkeys = jax.random.split(subkey, self.config.actor_batch_size)
         env_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         return TrainState(
@@ -131,15 +132,15 @@ class MuZeroTrainer(MuZero):
             buffer_state=buffer_state,
             env_states=env_states,
             opt_state=opt_state,
-            avg_return=jnp.zeros(self.config.batch_size),
-            avg_loss=jnp.zeros(self.config.batch_size),
-            avg_pi_loss=jnp.zeros(self.config.batch_size),
-            avg_value_loss=jnp.zeros(self.config.batch_size),
-            avg_reward_loss=jnp.zeros(self.config.batch_size),
-            episode_return=jnp.zeros(self.config.batch_size),
-            num_episodes=jnp.zeros(self.config.batch_size),
-            eval_avg_return=jnp.zeros(self.config.batch_size),
-            eval_episode_return=jnp.zeros(self.config.batch_size),
+            avg_return=jnp.zeros(self.config.actor_batch_size),
+            avg_loss=jnp.zeros(self.config.train_batch_size),
+            avg_pi_loss=jnp.zeros(self.config.train_batch_size),
+            avg_value_loss=jnp.zeros(self.config.train_batch_size),
+            avg_reward_loss=jnp.zeros(self.config.train_batch_size),
+            episode_return=jnp.zeros(self.config.actor_batch_size),
+            num_episodes=jnp.zeros(self.config.actor_batch_size),
+            eval_avg_return=jnp.zeros(self.config.actor_batch_size),
+            eval_episode_return=jnp.zeros(self.config.actor_batch_size),
             key=key,
         )
 
@@ -352,7 +353,7 @@ class MuZeroTrainer(MuZero):
         reward = jax.vmap(lambda x: x.reward)(steps)
         terminal = jax.vmap(lambda x: x.last())(steps)
 
-        subkeys = jax.random.split(key, self.config.batch_size)
+        subkeys = jax.random.split(key, self.config.actor_batch_size)
         reset_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         env_states = jax.vmap(
@@ -448,7 +449,7 @@ class MuZeroTrainer(MuZero):
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
         def loop_fn(state: TrainState, _):
-            state = jax.lax.fori_loop(0, 10, lambda _, x: self._actor_step(x), state)
+            state = self._actor_step(state)
 
             state = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
@@ -487,11 +488,11 @@ class MuZeroTrainer(MuZero):
             return next_states, reward_acc, done_mask, key, iter + 1
 
         key, subkey = jax.random.split(state.key)
-        reset_keys = jax.random.split(subkey, self.config.batch_size)
+        reset_keys = jax.random.split(subkey, self.config.actor_batch_size)
         env_states, _ = jax.vmap(self.env.reset)(reset_keys)
 
-        reward_acc = jnp.zeros(self.config.batch_size)
-        done_mask = jnp.zeros(self.config.batch_size, dtype=jnp.bool_)
+        reward_acc = jnp.zeros(self.config.actor_batch_size)
+        done_mask = jnp.zeros(self.config.actor_batch_size, dtype=jnp.bool_)
 
         _, reward_acc, _, _, _ = jax.lax.while_loop(
             lambda carry: jnp.any(~carry[2])
