@@ -132,11 +132,11 @@ class MuZeroTrainer(MuZero):
             buffer_state=buffer_state,
             env_states=env_states,
             opt_state=opt_state,
-            avg_return=jnp.zeros(self.config.actor_batch_size),
             avg_loss=jnp.zeros(self.config.train_batch_size),
             avg_pi_loss=jnp.zeros(self.config.train_batch_size),
             avg_value_loss=jnp.zeros(self.config.train_batch_size),
             avg_reward_loss=jnp.zeros(self.config.train_batch_size),
+            avg_return=jnp.zeros(self.config.actor_batch_size),
             episode_return=jnp.zeros(self.config.actor_batch_size),
             num_episodes=jnp.zeros(self.config.actor_batch_size),
             eval_avg_return=jnp.zeros(self.config.actor_batch_size),
@@ -235,7 +235,10 @@ class MuZeroTrainer(MuZero):
             )
 
             done_before_t = done_before_all[:, t]
-            next_state = jnp.where(done_before_t[:, None], hidden_state, next_state)
+            cond = jnp.expand_dims(
+                done_before_t.astype(bool), axis=tuple(range(1, hidden_state.ndim))
+            )
+            next_state = jnp.where(cond, hidden_state, next_state)
 
             v_scalar = v_scalar.at[:, t].set(value_scalar_t)
             v_logits = v_logits.at[:, t].set(value_logit_t)

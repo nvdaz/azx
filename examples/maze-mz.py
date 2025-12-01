@@ -26,7 +26,7 @@ config = TrainConfig(
     gumbel_scale=0.5,
     max_length_buffer=8192,
     min_length_buffer=64,
-    support_min=0,
+    support_min=-1,
     support_max=1,
     support_eps=0.001,
 )
@@ -93,7 +93,7 @@ class DynamicsModel(hk.Module):
 
         reward = hk.Linear(128)(x)
         reward = jax.nn.silu(reward)
-        reward = hk.Linear(2)(reward)
+        reward = hk.Linear(3)(reward)
 
         return next_latent, reward
 
@@ -110,7 +110,7 @@ class PredictionModel(hk.Module):
             x = jax.nn.silu(x)
 
         v = hk.Linear(128)(x)
-        value = hk.Linear(2)(v)
+        value = hk.Linear(3)(v)
 
         pi_logits = hk.Linear(128)(x)
         pi_logits = hk.Linear(self.action_dim)(pi_logits)  # (B, A)
