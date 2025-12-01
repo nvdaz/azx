@@ -34,6 +34,7 @@ class TrainConfig(Config):
 
 class TrainState(NamedTuple):
     model: ModelState
+    target_model: ModelState
     env_states: jax.Array
     buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
@@ -126,6 +127,7 @@ class MuZeroTrainer(MuZero):
 
         return TrainState(
             model=model,
+            target_model=model,
             buffer_state=buffer_state,
             env_states=env_states,
             opt_state=opt_state,
@@ -141,133 +143,199 @@ class MuZeroTrainer(MuZero):
             key=key,
         )
 
+    def _compute_target_values(
+        self,
+        target_model: ModelState,
+        key: jax.Array,
+        obs: jax.Array,
+    ) -> jax.Array:
+        B, T = obs.shape[:2]
+
+        flat_obs = obs.reshape(B * T, *obs.shape[2:])
+        flat_latents, _ = self.rep_net.apply(
+            target_model.params.rep, target_model.state.rep, key, flat_obs
+        )  # ignore update state since using frozen target model
+
+        (_, flat_value_logits), _ = self.pred_net.apply(
+            target_model.params.pred, target_model.state.pred, key, flat_latents
+        )
+
+        flat_values = self.support.decode_logits(flat_value_logits)
+        return flat_values.reshape(B, T)
+
     def _loss_fn(
         self,
         params: ModelParams,
         net_state: ModelNetState,
+        target: ModelState,
         rng: jax.Array,
         batch: TrajectoryBufferSample,
     ):
-        K = self.config.unroll_steps
-        T = self.config.n_step + self.config.unroll_steps
-        n = self.config.n_step
+        unroll_steps = self.config.unroll_steps
+        total_steps = self.config.n_step + unroll_steps
+        n_step = self.config.n_step
 
-        keys = jax.random.split(rng, T + 1)
-        rep_key, step_keys = keys[0], keys[1:]
+        exp = batch.experience
+        obs = exp.obs[:, :total_steps]
+        actions = exp.action
+        rewards = exp.reward
+        terminals = exp.terminal
+        target_pi = exp.pi
+        action_mask = exp.action_mask
 
-        obs = batch.experience.obs
-        actions = batch.experience.action
-        rewards = batch.experience.reward
-        discounts = self.config.discount * (1.0 - batch.experience.terminal)
-        target_pi = batch.experience.pi
-        action_mask = batch.experience.action_mask
+        discounts = self.config.discount * (1.0 - terminals)
+        batch_size = obs.shape[0]
 
-        s0, rep_state_new = self.rep_net.apply(
+        rng, target_key = jax.random.split(rng)
+        target_values_from_obs = self._compute_target_values(target, target_key, obs)
+        target_values_from_obs = jax.lax.stop_gradient(target_values_from_obs)
+
+        rng, rep_key = jax.random.split(rng)
+        root_state, rep_state_new = self.rep_net.apply(
             params.rep, net_state.rep, rep_key, obs[:, 0]
         )
 
-        B = self.config.batch_size
-        A = self.env.action_spec.num_values
-        S = self.support.size
+        rng, step_key = jax.random.split(rng)
+        step_keys = jax.random.split(step_key, total_steps)
 
-        v_values = jnp.zeros((B, T), dtype=jnp.float32)
-        v_logits_all = jnp.zeros((B, T, S), dtype=jnp.float32)
-        r_values = jnp.zeros((B, T), dtype=jnp.float32)
-        r_logits_all = jnp.zeros((B, T, S), dtype=jnp.float32)
-        logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
+        terminals_all = terminals[:, :total_steps]
+        done_cumulative = jnp.cumsum(terminals_all.astype(jnp.int32), axis=1) > 0
+        done_before_all = jnp.concatenate(
+            [
+                jnp.zeros_like(done_cumulative[:, :1], dtype=jnp.bool_),
+                done_cumulative[:, :-1],
+            ],
+            axis=1,
+        )
 
         def step_fn(carry, t):
-            s, pred_st, dyn_st, v_vals, v_logs, log_acc, r_vals, r_logs = carry
+            (
+                hidden_state,
+                pred_state,
+                dyn_state,
+                v_scalar,
+                v_logits,
+                p_logits,
+                r_logits,
+            ) = carry
             key = step_keys[t]
 
-            (pi_logits, v_logits), pred_st = self.pred_net.apply(
-                params.pred, pred_st, key, s
+            (policy_logit_t, value_logit_t), pred_state = self.pred_net.apply(
+                params.pred, pred_state, key, hidden_state
             )
-            v_scalar = self.support.decode_logits(v_logits)
+            value_scalar_t = self.support.decode_logits(value_logit_t)
 
-            s_scaled = 0.5 * s + 0.5 * jax.lax.stop_gradient(s)
-            (s_next, r_logits), dyn_st = self.dyn_net.apply(
-                params.dyn, dyn_st, key, s_scaled, actions[:, t]
+            scaled_state = 0.5 * hidden_state + 0.5 * jax.lax.stop_gradient(
+                hidden_state
             )
-            r_scalar = self.support.decode_logits(r_logits)
 
-            v_vals = v_vals.at[:, t].set(v_scalar)
-            v_logs = v_logs.at[:, t, :].set(v_logits)
-            r_vals = r_vals.at[:, t].set(r_scalar)
-            r_logs = r_logs.at[:, t].set(r_logits)
-            log_acc = log_acc.at[:, t, :].set(pi_logits)
+            (next_state, reward_logit_t), dyn_state = self.dyn_net.apply(
+                params.dyn, dyn_state, key, scaled_state, actions[:, t]
+            )
+
+            done_before_t = done_before_all[:, t]
+            next_state = jnp.where(done_before_t[:, None], hidden_state, next_state)
+
+            v_scalar = v_scalar.at[:, t].set(value_scalar_t)
+            v_logits = v_logits.at[:, t].set(value_logit_t)
+            r_logits = r_logits.at[:, t].set(reward_logit_t)
+            p_logits = p_logits.at[:, t].set(policy_logit_t)
 
             return (
-                s_next,
-                pred_st,
-                dyn_st,
-                v_vals,
-                v_logs,
-                log_acc,
-                r_vals,
-                r_logs,
+                next_state,
+                pred_state,
+                dyn_state,
+                v_scalar,
+                v_logits,
+                p_logits,
+                r_logits,
             ), None
 
-        (
-            (
-                _,
-                pred_state_new,
-                dyn_state_new,
-                v_values,
-                v_logits_all,
-                logits_all,
-                r_values,
-                r_logits_all,
-            ),
-            _,
-        ) = jax.lax.scan(
+        support_size = self.support.size
+
+        v_scalar_unroll = jnp.zeros((batch_size, total_steps), dtype=jnp.float32)
+        v_logits_unroll = jnp.zeros(
+            (batch_size, total_steps, support_size), dtype=jnp.float32
+        )
+        r_logits_unroll = jnp.zeros(
+            (batch_size, total_steps, support_size), dtype=jnp.float32
+        )
+        p_logits_unroll = jnp.zeros_like(target_pi[:, :total_steps])
+
+        (final_carry, _) = jax.lax.scan(
             step_fn,
             (
-                s0,
+                root_state,
                 net_state.pred,
                 net_state.dyn,
-                v_values,
-                v_logits_all,
-                logits_all,
-                r_values,
-                r_logits_all,
+                v_scalar_unroll,
+                v_logits_unroll,
+                p_logits_unroll,
+                r_logits_unroll,
             ),
-            jnp.arange(T),
+            jnp.arange(total_steps),
+        )
+        (
+            _,
+            pred_state_new,
+            dyn_state_new,
+            v_scalar_unroll,
+            v_logits_unroll,
+            p_logits_unroll,
+            r_logits_unroll,
+        ) = final_carry
+
+        nstep_returns = functools.partial(
+            rlax.n_step_bootstrapped_returns, n=n_step, stop_target_gradients=True
         )
 
-        value_seq = jnp.zeros_like(rewards)
-        value_seq = value_seq.at[:, n : n + K].set(v_values[:, n : n + K])
+        target_z = jax.vmap(nstep_returns)(rewards, discounts, target_values_from_obs)
 
-        nstep_fn = functools.partial(
-            rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
+        target_value_k = target_z[:, :unroll_steps]
+        pred_value_logits_k = v_logits_unroll[:, :unroll_steps]
+
+        pred_reward_logits_k = r_logits_unroll[:, :unroll_steps]
+        target_reward_k = rewards[:, :unroll_steps]
+
+        pred_policy_logits_k = p_logits_unroll[:, :unroll_steps]
+        target_policy_k = target_pi[:, :unroll_steps]
+        mask_k = action_mask[:, :unroll_steps]
+
+        masked_policy_logits = jnp.where(
+            mask_k,
+            pred_policy_logits_k,
+            jnp.array(-1e9, dtype=pred_policy_logits_k.dtype),
         )
-        z_targets = jax.vmap(nstep_fn)(rewards, discounts, value_seq)
-
-        z_t = z_targets[:, :K]
-        v_logits_t = v_logits_all[:, :K]  # (B, K, S)
-        r_logits_t = r_logits_all[:, :K]
-        r_true = rewards[:, :K]
-        logits_t = logits_all[:, :K]
-        pi_t = target_pi[:, :K]
-        mask_t = action_mask[:, :K]
-
-        masked_logits = jnp.where(
-            mask_t, logits_t, jnp.array(-1e9, dtype=logits_t.dtype)
+        masked_target_policy = target_policy_k * mask_k
+        target_policy_norm = masked_target_policy / (
+            masked_target_policy.sum(-1, keepdims=True) + 1e-9
         )
-        masked_targets = pi_t * mask_t
-        target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
 
-        v_prob = self.support.encode(z_t)  # (B, K, S)
-        r_prob = self.support.encode(r_true)
+        target_value_prob = self.support.encode(target_value_k)
+        target_reward_prob = self.support.encode(target_reward_k)
 
-        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
-        loss_v = optax.softmax_cross_entropy(v_logits_t, v_prob).mean()
-        loss_r = optax.softmax_cross_entropy(r_logits_t, r_prob).mean()
+        alive_mask = (~done_before_all[:, :unroll_steps]).astype(jnp.float32)
+        alive_sum = alive_mask.sum() + 1e-9
+
+        loss_pi = (
+            optax.softmax_cross_entropy(masked_policy_logits, target_policy_norm)
+            * alive_mask
+        ).sum() / alive_sum
+        loss_v = (
+            optax.softmax_cross_entropy(pred_value_logits_k, target_value_prob)
+            * alive_mask
+        ).sum() / alive_sum
+        loss_r = (
+            optax.softmax_cross_entropy(pred_reward_logits_k, target_reward_prob)
+            * alive_mask
+        ).sum() / alive_sum
 
         total_loss = loss_pi + 0.5 * loss_v + 0.5 * loss_r
 
         new_net_state = ModelNetState(
-            rep=rep_state_new, pred=pred_state_new, dyn=dyn_state_new
+            rep=rep_state_new,
+            pred=pred_state_new,
+            dyn=dyn_state_new,
         )
 
         return total_loss, (
@@ -304,10 +372,11 @@ class MuZeroTrainer(MuZero):
 
         (loss, (net_state, loss_r, loss_v, loss_pi)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(state.model.params, state.model.state, key, batch)
+        )(state.model.params, state.model.state, state.target_model, key, batch)
 
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
+        chex.assert_trees_all_equal_shapes_and_dtypes(state.model.params, params)
 
         avg_pi = state.avg_pi_loss * self.config.avg_return_smoothing + loss_pi * (
             1 - self.config.avg_return_smoothing
@@ -332,49 +401,54 @@ class MuZeroTrainer(MuZero):
             avg_reward_loss=avg_r,
         )
 
+    def _actor_step(self, state: TrainState) -> TrainState:
+        key, search_key, step_key = jax.random.split(state.key, 3)
+        obs = jax.vmap(self.obs_fn)(state.env_states)
+        valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
+
+        policy_output = self._muzero_search(
+            state.model,
+            search_key,
+            obs,
+            valid_actions,
+        )
+        env_states, reward, terminal = self._step_env(
+            step_key, state.env_states, policy_output.action
+        )
+
+        experience = TimeStep(
+            obs=obs[:, None, ...],
+            reward=reward[:, None, ...],
+            terminal=terminal[:, None, ...],
+            pi=policy_output.action_weights[:, None, ...],
+            action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
+            action=policy_output.action[:, None],
+        )
+        buffer_state = self.buffer.add(state.buffer_state, experience)
+
+        new_return = state.episode_return + reward
+        next_episode_return = jnp.where(terminal, 0, new_return)
+        next_avg_return = jnp.where(
+            terminal,
+            state.avg_return * self.config.avg_return_smoothing
+            + new_return * (1 - self.config.avg_return_smoothing),
+            state.avg_return,
+        )
+        next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
+
+        return state._replace(
+            key=key,
+            buffer_state=buffer_state,
+            env_states=env_states,
+            episode_return=next_episode_return,
+            avg_return=next_avg_return,
+            num_episodes=next_num_episodes,
+        )
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def train_step(self, state: TrainState) -> TrainState:
         def loop_fn(state: TrainState, _):
-            key, search_key, step_key = jax.random.split(state.key, 3)
-            obs = jax.vmap(self.obs_fn)(state.env_states)
-            valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
-
-            policy_output = self._muzero_search(
-                state.model, search_key, obs, valid_actions
-            )
-            env_states, reward, terminal = self._step_env(
-                step_key, state.env_states, policy_output.action
-            )
-
-            experience = TimeStep(
-                obs=obs[:, None, ...],
-                reward=reward[:, None, ...],
-                terminal=terminal[:, None, ...],
-                pi=policy_output.action_weights[:, None, ...],
-                action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
-                action=policy_output.action[:, None],
-            )
-            buffer_state = self.buffer.add(state.buffer_state, experience)
-
-            new_return = state.episode_return + reward
-
-            next_episode_return = jnp.where(terminal, 0, new_return)
-            next_avg_return = jnp.where(
-                terminal,
-                state.avg_return * self.config.avg_return_smoothing
-                + new_return * (1 - self.config.avg_return_smoothing),
-                state.avg_return,
-            )
-            next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
-
-            state = state._replace(
-                key=key,
-                buffer_state=buffer_state,
-                env_states=env_states,
-                episode_return=next_episode_return,
-                avg_return=next_avg_return,
-                num_episodes=next_num_episodes,
-            )
+            state = jax.lax.fori_loop(0, 10, lambda _, x: self._actor_step(x), state)
 
             state = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
@@ -386,7 +460,7 @@ class MuZeroTrainer(MuZero):
             return state, None
 
         state, _ = jax.lax.scan(loop_fn, state, None, self.config.eval_frequency)
-        return state
+        return state._replace(target_model=state.model)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
@@ -474,5 +548,7 @@ class MuZeroTrainer(MuZero):
 
     def restore_checkpoint(self, filename: str, directory: Path):
         state = self.init(jax.random.PRNGKey(0))  # create dummy state
-        self.train_checkpointer.restore(directory / filename, state)
+        state = self.train_checkpointer.restore(
+            directory / filename, state, strict=True
+        )
         return state

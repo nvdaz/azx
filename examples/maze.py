@@ -40,7 +40,7 @@ class MLP(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        for width in (256, 256, 256):
+        for width in (128, 128, 128):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = self.act(x)

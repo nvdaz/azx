@@ -145,7 +145,7 @@ class AlphaZeroTrainer(AlphaZero):
             obs = s0[:, t]
             (logits, v_logits), pred_st = self.network.apply(params, pred_st, key, obs)
 
-            v_acc = v_acc.at[:, t].set(self.support.decode(v_logits))
+            v_acc = v_acc.at[:, t].set(self.support.decode_logits(v_logits))
             v_log_acc = v_log_acc.at[:, t].set(v_logits)
             log_acc = log_acc.at[:, t, :].set(logits)
 

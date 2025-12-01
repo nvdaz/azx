@@ -19,7 +19,7 @@ config = TrainConfig(
     unroll_steps=4,
     avg_return_smoothing=0.99,
     num_simulations=50,
-    eval_frequency=1000,
+    eval_frequency=100,
     max_eval_steps=100,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
@@ -62,7 +62,7 @@ class RepresentationModel(hk.Module):
 
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        for width in (64, 64, 64):
+        for width in (128, 128, 128):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -81,7 +81,7 @@ class DynamicsModel(hk.Module):
         action = action.astype(jnp.int32)
         action_oh = jax.nn.one_hot(action, self.action_dim)
         x = jnp.concatenate([latent, action_oh], axis=-1)  # (B, L + A)
-        for width in (64, 64, 64):
+        for width in (128, 128, 128):
             x = hk.Linear(width)(x)
             x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
             x = jax.nn.silu(x)
@@ -91,7 +91,8 @@ class DynamicsModel(hk.Module):
         next_latent = hk.Linear(self.latent_dim)(next_latent)  # (B, L)
 
         reward = hk.Linear(128)(x)
-        reward = hk.Linear(2)(x)
+        reward = jax.nn.silu(reward)
+        reward = hk.Linear(2)(reward)
 
         return next_latent, reward
 
@@ -117,7 +118,7 @@ class PredictionModel(hk.Module):
 
 env = Maze(RandomGenerator(5, 5))
 action_dim = env.action_spec.num_values
-latent_dim = 64
+latent_dim = 128
 
 
 def action_mask_fn(state):
