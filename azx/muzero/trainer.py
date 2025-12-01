@@ -23,6 +23,7 @@ from .agent import Config, ModelNetState, ModelParams, ModelState, MuZero
 class TrainConfig(Config):
     actor_batch_size: int
     train_batch_size: int
+    gumbel_scale: float
     eval_frequency: int
     n_step: int
     unroll_steps: int
@@ -415,6 +416,7 @@ class MuZeroTrainer(MuZero):
             search_key,
             obs,
             valid_actions,
+            gumbel_scale=self.config.gumbel_scale,
         )
         env_states, reward, terminal = self._step_env(
             step_key, state.env_states, policy_output.action
@@ -474,9 +476,7 @@ class MuZeroTrainer(MuZero):
             obs = jax.vmap(self.obs_fn)(env_states)
 
             valid_actions = jax.vmap(self.action_mask_fn)(env_states)
-            policy_output = self._muzero_search(
-                state.model, subkey, obs, valid_actions, eval=True
-            )
+            policy_output = self._muzero_search(state.model, subkey, obs, valid_actions)
             action = policy_output.action
 
             # step the envs

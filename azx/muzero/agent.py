@@ -17,7 +17,6 @@ class Config:
     num_simulations: int
     use_mixed_value: bool
     value_scale: float
-    gumbel_scale: float
     support_min: int
     support_max: int
     support_eps: float
@@ -91,7 +90,7 @@ class MuZero:
         key: chex.PRNGKey,
         obs: jax.Array,
         valid_actions: jax.Array,
-        eval: bool = False,
+        gumbel_scale: float = 0.0,
     ) -> mctx.PolicyOutput:
         key, rep_key, pred_key, mcts_key = jax.random.split(key, 4)
         latent, _ = self.rep_net.apply(model.params.rep, model.state.rep, rep_key, obs)
@@ -120,7 +119,7 @@ class MuZero:
                 use_mixed_value=self.config.use_mixed_value,
                 value_scale=self.config.value_scale,
             ),
-            gumbel_scale=jnp.where(eval, 0.0, self.config.gumbel_scale),
+            gumbel_scale=gumbel_scale,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -136,7 +135,6 @@ class MuZero:
             key=key,
             obs=obs[None, ...],
             valid_actions=valid_actions,
-            eval=True,
         )
 
         return policy_output.action[0]
