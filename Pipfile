@@ -11,6 +11,7 @@ optax = "*"
 jumanji = "*"
 flashbax = "*"
 rlax = "*"
+tqdm = "*"
 
 [dev-packages]
 ruff = {version = "*", extras = ["format"]}

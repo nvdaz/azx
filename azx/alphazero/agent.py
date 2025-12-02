@@ -18,7 +18,6 @@ class Config:
     num_simulations: int
     use_mixed_value: bool
     value_scale: float
-    gumbel_scale: float
     support_min: int
     support_max: int
     support_eps: float
@@ -83,7 +82,7 @@ class AlphaZero:
         model: ModelState,
         key: chex.PRNGKey,
         env_states: jax.Array,
-        eval: bool = False,
+        gumbel_scale: float = 0.0,
     ) -> mctx.PolicyOutput:
         obs = jax.vmap(self.obs_fn)(env_states)
         key, apply_key, mcts_key = jax.random.split(key, 3)
@@ -114,7 +113,7 @@ class AlphaZero:
                 use_mixed_value=self.config.use_mixed_value,
                 value_scale=self.config.value_scale,
             ),
-            gumbel_scale=jnp.where(eval, 0.0, self.config.gumbel_scale),
+            gumbel_scale=gumbel_scale,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -124,7 +123,7 @@ class AlphaZero:
         env_states = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state)
 
         policy_output = self._alphazero_search(
-            model=model, key=key, env_states=env_states, eval=True
+            model=model, key=key, env_states=env_states
         )
 
         return policy_output.action[0]

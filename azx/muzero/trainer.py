@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+from copy import deepcopy
 from pathlib import Path
 from typing import Callable, NamedTuple
 
@@ -15,6 +16,7 @@ from flashbax.buffers.trajectory_buffer import (
     TrajectoryBufferState,
 )
 from jumanji.env import Environment
+from tqdm import tqdm
 
 from .agent import Config, ModelNetState, ModelParams, ModelState, MuZero
 
@@ -129,7 +131,7 @@ class MuZeroTrainer(MuZero):
 
         return TrainState(
             model=model,
-            target_model=model,
+            target_model=deepcopy(model),
             buffer_state=buffer_state,
             env_states=env_states,
             opt_state=opt_state,
@@ -215,7 +217,6 @@ class MuZeroTrainer(MuZero):
                 hidden_state,
                 pred_state,
                 dyn_state,
-                v_scalar,
                 v_logits,
                 p_logits,
                 r_logits,
@@ -225,7 +226,6 @@ class MuZeroTrainer(MuZero):
             (policy_logit_t, value_logit_t), pred_state = self.pred_net.apply(
                 params.pred, pred_state, key, hidden_state
             )
-            value_scalar_t = self.support.decode_logits(value_logit_t)
 
             scaled_state = 0.5 * hidden_state + 0.5 * jax.lax.stop_gradient(
                 hidden_state
@@ -241,7 +241,6 @@ class MuZeroTrainer(MuZero):
             )
             next_state = jnp.where(cond, hidden_state, next_state)
 
-            v_scalar = v_scalar.at[:, t].set(value_scalar_t)
             v_logits = v_logits.at[:, t].set(value_logit_t)
             r_logits = r_logits.at[:, t].set(reward_logit_t)
             p_logits = p_logits.at[:, t].set(policy_logit_t)
@@ -250,7 +249,6 @@ class MuZeroTrainer(MuZero):
                 next_state,
                 pred_state,
                 dyn_state,
-                v_scalar,
                 v_logits,
                 p_logits,
                 r_logits,
@@ -258,7 +256,6 @@ class MuZeroTrainer(MuZero):
 
         support_size = self.support.size
 
-        v_scalar_unroll = jnp.zeros((batch_size, total_steps), dtype=jnp.float32)
         v_logits_unroll = jnp.zeros(
             (batch_size, total_steps, support_size), dtype=jnp.float32
         )
@@ -273,7 +270,6 @@ class MuZeroTrainer(MuZero):
                 root_state,
                 net_state.pred,
                 net_state.dyn,
-                v_scalar_unroll,
                 v_logits_unroll,
                 p_logits_unroll,
                 r_logits_unroll,
@@ -284,7 +280,6 @@ class MuZeroTrainer(MuZero):
             _,
             pred_state_new,
             dyn_state_new,
-            v_scalar_unroll,
             v_logits_unroll,
             p_logits_unroll,
             r_logits_unroll,
@@ -515,7 +510,8 @@ class MuZeroTrainer(MuZero):
         steps = []
         time_step = 0
 
-        for _ in range(num_steps // self.config.eval_frequency):
+        pbar = tqdm(range(num_steps // self.config.eval_frequency), leave=True)
+        for _ in pbar:
             state = self.train_step(state)
 
             valid_returns = state.avg_return[state.num_episodes > 0]
@@ -530,11 +526,10 @@ class MuZeroTrainer(MuZero):
             steps.append(time_step)
             ev = self.evaluate(state, self.config.max_eval_steps)
 
-            print(
+            pbar.write(
                 f"Step {time_step:06d} | Avg Return: {avg_return:.3f} | "
                 f"Eval: {ev:.3f} | Loss: {avg_loss:.3f} | R Loss: {avg_reward_loss:.3f} | "
                 f"Pi Loss: {avg_pi_loss:.3f} | Value Loss: {avg_value_loss:.3f}",
-                flush=True,
             )
 
             if time_step % self.config.checkpoint_frequency == 0:

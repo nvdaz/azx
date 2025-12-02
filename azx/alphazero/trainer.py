@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+from copy import deepcopy
 from pathlib import Path
 from typing import Callable, NamedTuple
 
@@ -16,14 +17,17 @@ from flashbax.buffers.trajectory_buffer import (
     TrajectoryBufferState,
 )
 from jumanji.env import Environment
+from tqdm import tqdm
 
 from .agent import AlphaZero, Config, ModelState
 
 
 @dataclasses.dataclass
 class TrainConfig(Config):
-    batch_size: int
+    actor_batch_size: int
+    train_batch_size: int
     eval_frequency: int
+    gumbel_scale: float
     n_step: int
     unroll_steps: int
     max_eval_steps: int
@@ -35,6 +39,7 @@ class TrainConfig(Config):
 
 class TrainState(NamedTuple):
     model: ModelState
+    target_model: ModelState
     env_states: jax.Array
     buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
@@ -74,8 +79,8 @@ class AlphaZeroTrainer(AlphaZero):
         self.buffer = fbx.make_trajectory_buffer(
             max_length_time_axis=config.max_length_buffer,
             min_length_time_axis=config.min_length_buffer,
-            sample_batch_size=config.batch_size,
-            add_batch_size=config.batch_size,
+            sample_batch_size=config.train_batch_size,
+            add_batch_size=config.actor_batch_size,
             sample_sequence_length=config.n_step + config.unroll_steps,
             period=1,
         )
@@ -100,95 +105,142 @@ class AlphaZeroTrainer(AlphaZero):
         opt_state = self.opt.init(params)
 
         key, subkey = jax.random.split(key)
-        subkeys = jax.random.split(subkey, self.config.batch_size)
+        subkeys = jax.random.split(subkey, self.config.actor_batch_size)
         env_states, _ = jax.vmap(self.env.reset)(subkeys)
 
+        model = ModelState(params, net_state)
+
         return TrainState(
-            model=ModelState(params, net_state),
+            model=model,
+            target_model=deepcopy(model),
             env_states=env_states,
             buffer_state=buffer_state,
             opt_state=opt_state,
-            avg_return=jnp.zeros(self.config.batch_size),
-            avg_loss=jnp.zeros(self.config.batch_size),
-            avg_pi_loss=jnp.zeros(self.config.batch_size),
-            avg_value_loss=jnp.zeros(self.config.batch_size),
-            episode_return=jnp.zeros(self.config.batch_size),
-            num_episodes=jnp.zeros(self.config.batch_size),
-            eval_avg_return=jnp.zeros(self.config.batch_size),
-            eval_episode_return=jnp.zeros(self.config.batch_size),
+            avg_loss=jnp.zeros(self.config.train_batch_size),
+            avg_pi_loss=jnp.zeros(self.config.train_batch_size),
+            avg_value_loss=jnp.zeros(self.config.train_batch_size),
+            avg_return=jnp.zeros(self.config.actor_batch_size),
+            episode_return=jnp.zeros(self.config.actor_batch_size),
+            num_episodes=jnp.zeros(self.config.actor_batch_size),
+            eval_avg_return=jnp.zeros(self.config.actor_batch_size),
+            eval_episode_return=jnp.zeros(self.config.actor_batch_size),
             key=key,
         )
+
+    def _compute_target_values(
+        self,
+        target_model: ModelState,
+        key: jax.Array,
+        obs: jax.Array,
+    ) -> jax.Array:
+        B, T = obs.shape[:2]
+
+        flat_obs = obs.reshape(B * T, *obs.shape[2:])
+
+        (_, flat_value_logits), _ = self.network.apply(
+            target_model.params, target_model.state, key, flat_obs
+        )
+
+        flat_values = self.support.decode_logits(flat_value_logits)
+        return flat_values.reshape(B, T)
 
     def _loss_fn(
         self,
         params: hk.MutableParams,
         net_state: hk.MutableState,
+        target: ModelState,
         rng: jax.Array,
         batch: TrajectoryBufferSample,
     ):
-        K = self.config.unroll_steps
-        T = self.config.n_step + self.config.unroll_steps
-        n = self.config.n_step
+        unroll_steps = self.config.unroll_steps
+        total_steps = self.config.n_step + self.config.unroll_steps
+        n_step = self.config.n_step
 
-        step_keys = jax.random.split(rng, T)
+        exp = batch.experience
+        obs = exp.obs
+        rewards = exp.reward
+        terminals = exp.terminal
+        target_pi = exp.pi
+        action_mask = exp.action_mask
 
-        s0 = batch.experience.obs
-        rewards = batch.experience.reward
-        discounts = self.config.discount * (1.0 - batch.experience.terminal)
-        target_pi = batch.experience.pi
-        action_mask = batch.experience.action_mask
+        discounts = self.config.discount * (1.0 - terminals)
+        batch_size = obs.shape[0]
+
+        rng, target_key = jax.random.split(rng)
+        target_values_from_obs = self._compute_target_values(target, target_key, obs)
+        target_values_from_obs = jax.lax.stop_gradient(target_values_from_obs)
+
+        rng, step_rng = jax.random.split(rng)
+        step_keys = jax.random.split(step_rng, total_steps)
+
+        support_size = self.support.size
+        num_actions = self.env.action_spec.num_values
 
         def step_fn(carry, t):
-            pred_st, v_acc, v_log_acc, log_acc = carry
+            pred_state, v_logits, p_logits = carry
             key = step_keys[t]
 
-            obs = s0[:, t]
-            (logits, v_logits), pred_st = self.network.apply(params, pred_st, key, obs)
+            obs_t = obs[:, t]
+            (policy_logits_t, value_logits_t), pred_state = self.network.apply(
+                params, pred_state, key, obs_t
+            )
 
-            v_acc = v_acc.at[:, t].set(self.support.decode_logits(v_logits))
-            v_log_acc = v_log_acc.at[:, t].set(v_logits)
-            log_acc = log_acc.at[:, t, :].set(logits)
+            v_logits = v_logits.at[:, t].set(value_logits_t)
+            p_logits = p_logits.at[:, t].set(policy_logits_t)
 
-            return (pred_st, v_acc, v_log_acc, log_acc), None
+            return (pred_state, v_logits, p_logits), None
 
-        B = self.config.batch_size
-        A = self.env.action_spec.num_values
-        S = self.support.size
-        v_preds = jnp.zeros((B, T), dtype=jnp.float32)
-        v_log = jnp.zeros((B, T, S), dtype=jnp.float32)
-        logits_all = jnp.zeros((B, T, A), dtype=jnp.float32)
+        v_logits_unroll = jnp.zeros(
+            (batch_size, total_steps, support_size), dtype=jnp.float32
+        )
+        p_logits_unroll = jnp.zeros(
+            (batch_size, total_steps, num_actions), dtype=jnp.float32
+        )
 
-        (pred_state_new, v_preds, v_log, logits_all), _ = jax.lax.scan(
+        (pred_state_new, v_logits_unroll, p_logits_unroll), _ = jax.lax.scan(
             step_fn,
-            (net_state, v_preds, v_log, logits_all),
-            jnp.arange(T),
+            (net_state, v_logits_unroll, p_logits_unroll),
+            jnp.arange(total_steps),
         )
 
-        value_seq = jnp.zeros_like(rewards)
-        value_seq = value_seq.at[:, n : n + K].set(v_preds[:, n : n + K])
-
-        nstep_fn = functools.partial(
-            rlax.n_step_bootstrapped_returns, n=n, stop_target_gradients=True
+        nstep_returns = functools.partial(
+            rlax.n_step_bootstrapped_returns,
+            n=n_step,
+            stop_target_gradients=True,
         )
-        z_targets = jax.vmap(nstep_fn)(rewards, discounts, value_seq)
+        target_z = jax.vmap(nstep_returns)(rewards, discounts, target_values_from_obs)
 
-        z_t = z_targets[:, :K]
-        v_logits_t = v_log[:, :K]  # (B, K, S)
-        v_t = v_preds[:, :K]
-        logits_t = logits_all[:, :K]
-        pi_t = target_pi[:, :K]
-        mask_t = action_mask[:, :K]
+        # Slice the first K steps
+        target_value_k = target_z[:, :unroll_steps]  # (B, K)
+        pred_value_logits_k = v_logits_unroll[:, :unroll_steps]  # (B, K, S)
 
-        masked_logits = jnp.where(
-            mask_t, logits_t, jnp.array(-1e9, dtype=logits_t.dtype)
+        pred_policy_logits_k = p_logits_unroll[:, :unroll_steps]  # (B, K, A)
+        target_policy_k = target_pi[:, :unroll_steps]  # (B, K, A)
+        mask_k = action_mask[:, :unroll_steps]  # (B, K, A)
+
+        # Masking and normalization in the same style as MuZero
+        masked_policy_logits = jnp.where(
+            mask_k,
+            pred_policy_logits_k,
+            jnp.array(-1e9, dtype=pred_policy_logits_k.dtype),
         )
-        masked_targets = pi_t * mask_t
-        target_pi_norm = masked_targets / (masked_targets.sum(-1, keepdims=True) + 1e-9)
+        masked_target_policy = target_policy_k * mask_k
+        target_policy_norm = masked_target_policy / (
+            masked_target_policy.sum(-1, keepdims=True) + 1e-9
+        )
 
-        v_prob = self.support.encode(z_t)
+        # Categorical targets over the value support
+        target_value_prob = self.support.encode(target_value_k)
 
-        loss_pi = optax.softmax_cross_entropy(masked_logits, target_pi_norm).mean()
-        loss_v = optax.softmax_cross_entropy(v_logits_t, v_prob).mean()
+        loss_pi = optax.softmax_cross_entropy(
+            masked_policy_logits,
+            target_policy_norm,
+        ).mean()
+
+        loss_v = optax.softmax_cross_entropy(
+            pred_value_logits_k,
+            target_value_prob,
+        ).mean()
 
         total_loss = loss_pi + 0.5 * loss_v
 
@@ -205,7 +257,7 @@ class AlphaZeroTrainer(AlphaZero):
         reward = jax.vmap(lambda x: x.reward)(steps)
         terminal = jax.vmap(lambda x: x.last())(steps)
 
-        subkeys = jax.random.split(key, self.config.batch_size)
+        subkeys = jax.random.split(key, self.config.actor_batch_size)
         reset_states, _ = jax.vmap(self.env.reset)(subkeys)
 
         env_states = jax.vmap(
@@ -225,7 +277,7 @@ class AlphaZeroTrainer(AlphaZero):
 
         (loss, (net_state, loss_v, loss_pi)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(state.model.params, state.model.state, subkey, batch)
+        )(state.model.params, state.model.state, state.target_model, subkey, batch)
 
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
@@ -249,50 +301,52 @@ class AlphaZeroTrainer(AlphaZero):
             avg_value_loss=avg_v,
         )
 
+    def _actor_step(self, state: TrainState) -> TrainState:
+        key, search_key, step_key = jax.random.split(state.key, 3)
+        obs = jax.vmap(self.obs_fn)(state.env_states)
+        valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
+
+        policy_output = self._alphazero_search(
+            model=state.model,
+            key=search_key,
+            env_states=state.env_states,
+            gumbel_scale=self.config.gumbel_scale,
+        )
+        env_states, reward, terminal = self._step_env(
+            step_key, state.env_states, policy_output.action
+        )
+
+        experience = TimeStep(
+            obs=obs[:, None, ...],
+            reward=reward[:, None, ...],
+            terminal=terminal[:, None, ...],
+            pi=policy_output.action_weights[:, None, ...],
+            action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
+        )
+        buffer_state = self.buffer.add(state.buffer_state, experience)
+
+        new_return = state.episode_return + reward
+        next_episode_return = jnp.where(terminal, 0, new_return)
+        next_avg_return = jnp.where(
+            terminal,
+            new_return,
+            state.avg_return,
+        )
+        next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
+
+        return state._replace(
+            key=key,
+            buffer_state=buffer_state,
+            env_states=env_states,
+            episode_return=next_episode_return,
+            avg_return=next_avg_return,
+            num_episodes=next_num_episodes,
+        )
+
     @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def train_step(self, state: TrainState) -> TrainState:
         def loop_fn(state: TrainState, _):
-            key, search_key, step_key = jax.random.split(state.key, 3)
-            obs = jax.vmap(self.obs_fn)(state.env_states)
-            valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
-
-            policy_output = self._alphazero_search(
-                model=state.model,
-                key=search_key,
-                env_states=state.env_states,
-                eval=False,
-            )
-            env_states, reward, terminal = self._step_env(
-                step_key, state.env_states, policy_output.action
-            )
-
-            experience = TimeStep(
-                obs=obs[:, None, ...],
-                reward=reward[:, None, ...],
-                terminal=terminal[:, None, ...],
-                pi=policy_output.action_weights[:, None, ...],
-                action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
-            )
-            buffer_state = self.buffer.add(state.buffer_state, experience)
-
-            new_return = state.episode_return + reward
-
-            next_episode_return = jnp.where(terminal, 0, new_return)
-            next_avg_return = jnp.where(
-                terminal,
-                new_return,
-                state.avg_return,
-            )
-            next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
-
-            state = state._replace(
-                key=key,
-                buffer_state=buffer_state,
-                env_states=env_states,
-                episode_return=next_episode_return,
-                avg_return=next_avg_return,
-                num_episodes=next_num_episodes,
-            )
+            state = self._actor_step(state)
 
             state = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
@@ -304,7 +358,7 @@ class AlphaZeroTrainer(AlphaZero):
             return state, None
 
         state, _ = jax.lax.scan(loop_fn, state, None, length=self.config.eval_frequency)
-        return state
+        return state._replace(target_model=state.model)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
@@ -312,9 +366,7 @@ class AlphaZeroTrainer(AlphaZero):
             env_states, reward_acc, done_mask, key, iter = carry
             key, subkey = jax.random.split(key)
 
-            policy_output = self._alphazero_search(
-                state.model, subkey, env_states, eval=True
-            )
+            policy_output = self._alphazero_search(state.model, subkey, env_states)
             action = policy_output.action
 
             # step the envs
@@ -329,11 +381,11 @@ class AlphaZeroTrainer(AlphaZero):
             return next_states, reward_acc, done_mask, key, iter + 1
 
         key, subkey = jax.random.split(state.key)
-        reset_keys = jax.random.split(subkey, self.config.batch_size)
+        reset_keys = jax.random.split(subkey, self.config.actor_batch_size)
         env_states, _ = jax.vmap(self.env.reset)(reset_keys)
 
-        reward_acc = jnp.zeros(self.config.batch_size)
-        done_mask = jnp.zeros(self.config.batch_size, dtype=jnp.bool_)
+        reward_acc = jnp.zeros(self.config.actor_batch_size)
+        done_mask = jnp.zeros(self.config.actor_batch_size, dtype=jnp.bool_)
 
         _, reward_acc, _, _, _ = jax.lax.while_loop(
             lambda carry: jnp.any(~carry[2])
@@ -353,7 +405,8 @@ class AlphaZeroTrainer(AlphaZero):
         steps = []
         time_step = 0
 
-        for _ in range(num_steps // self.config.eval_frequency):
+        pbar = tqdm(range(num_steps // self.config.eval_frequency), leave=True)
+        for _ in pbar:
             state = self.train_step(state)
 
             valid_returns = state.avg_return[state.num_episodes > 0]
@@ -366,10 +419,9 @@ class AlphaZeroTrainer(AlphaZero):
             steps.append(time_step)
             ev = self.evaluate(state, self.config.max_eval_steps)
 
-            print(
-                f"Step {time_step} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
+            pbar.write(
+                f"Step {time_step:06d} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
                 f"Pi Loss: {avg_pi_loss:.3f} | Value Loss: {avg_value_loss:.3f}",
-                flush=True,
             )
 
             if time_step % self.config.checkpoint_frequency == 0:

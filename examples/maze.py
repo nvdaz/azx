@@ -14,18 +14,19 @@ config = TrainConfig(
     discount=0.99,
     use_mixed_value=True,
     value_scale=1.0,
-    batch_size=32,
+    actor_batch_size=128,
+    train_batch_size=64,
     n_step=8,
     unroll_steps=4,
     avg_return_smoothing=0.99,
-    num_simulations=100,
-    eval_frequency=100,
+    num_simulations=5,
+    eval_frequency=1000,
     max_eval_steps=100,
     checkpoint_frequency=100000,
     gumbel_scale=0.5,
-    max_length_buffer=64,
-    min_length_buffer=24,
-    support_min=0,
+    max_length_buffer=1024,
+    min_length_buffer=64,
+    support_min=-1,
     support_max=1,
     support_eps=0.001,
 )
@@ -50,7 +51,7 @@ class MLP(hk.Module):
 
         v = hk.Linear(128)(x)
         v = self.act(v)
-        v = hk.Linear(2)(v)
+        v = hk.Linear(3)(v)
 
         return pi_logits, v
 
@@ -104,6 +105,6 @@ checkpoints_dir.mkdir(exist_ok=True)
 
 state, returns, steps = trainer.learn(
     state=state,
-    num_steps=1000,
+    num_steps=100000,
     checkpoints_dir="./checkpoints",
 )
