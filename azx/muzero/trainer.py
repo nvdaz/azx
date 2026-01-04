@@ -61,6 +61,7 @@ class TimeStep(NamedTuple):
     pi: jax.Array
     action_mask: jax.Array
     action: jax.Array
+    value: jax.Array
 
 
 class MuZeroTrainer(MuZero):
@@ -103,6 +104,7 @@ class MuZeroTrainer(MuZero):
             pi=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.float32),
             action_mask=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.bool_),
             action=jnp.zeros((), dtype=jnp.int32),
+            value=jnp.zeros((), dtype=jnp.float32),
         )
         buffer_state = self.buffer.init(experience)
 
@@ -147,31 +149,10 @@ class MuZeroTrainer(MuZero):
             key=key,
         )
 
-    def _compute_target_values(
-        self,
-        target_model: ModelState,
-        key: jax.Array,
-        obs: jax.Array,
-    ) -> jax.Array:
-        B, T = obs.shape[:2]
-
-        flat_obs = obs.reshape(B * T, *obs.shape[2:])
-        flat_latents, _ = self.rep_net.apply(
-            target_model.params.rep, target_model.state.rep, key, flat_obs
-        )  # ignore update state since using frozen target model
-
-        (_, flat_value_logits), _ = self.pred_net.apply(
-            target_model.params.pred, target_model.state.pred, key, flat_latents
-        )
-
-        flat_values = self.support.decode_logits(flat_value_logits)
-        return flat_values.reshape(B, T)
-
     def _loss_fn(
         self,
         params: ModelParams,
         net_state: ModelNetState,
-        target: ModelState,
         rng: jax.Array,
         batch: TrajectoryBufferSample,
     ):
@@ -186,13 +167,10 @@ class MuZeroTrainer(MuZero):
         terminals = exp.terminal
         target_pi = exp.pi
         action_mask = exp.action_mask
+        target_mcts_value = exp.value
 
         discounts = self.config.discount * (1.0 - terminals)
         batch_size = obs.shape[0]
-
-        rng, target_key = jax.random.split(rng)
-        target_values_from_obs = self._compute_target_values(target, target_key, obs)
-        target_values_from_obs = jax.lax.stop_gradient(target_values_from_obs)
 
         rng, rep_key = jax.random.split(rng)
         root_state, rep_state_new = self.rep_net.apply(
@@ -289,7 +267,7 @@ class MuZeroTrainer(MuZero):
             rlax.n_step_bootstrapped_returns, n=n_step, stop_target_gradients=True
         )
 
-        target_z = jax.vmap(nstep_returns)(rewards, discounts, target_values_from_obs)
+        target_z = jax.vmap(nstep_returns)(rewards, discounts, target_mcts_value)
 
         target_value_k = target_z[:, :unroll_steps]
         pred_value_logits_k = v_logits_unroll[:, :unroll_steps]
@@ -372,7 +350,7 @@ class MuZeroTrainer(MuZero):
 
         (loss, (net_state, loss_r, loss_v, loss_pi)), grads = jax.value_and_grad(
             self._loss_fn, argnums=0, has_aux=True
-        )(state.model.params, state.model.state, state.target_model, key, batch)
+        )(state.model.params, state.model.state, key, batch)
 
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
@@ -413,6 +391,9 @@ class MuZeroTrainer(MuZero):
             valid_actions,
             gumbel_scale=self.config.gumbel_scale,
         )
+        root_value = policy_output.search_tree.raw_values[
+            :, policy_output.search_tree.ROOT_INDEX
+        ]
         env_states, reward, terminal = self._step_env(
             step_key, state.env_states, policy_output.action
         )
@@ -424,6 +405,7 @@ class MuZeroTrainer(MuZero):
             pi=policy_output.action_weights[:, None, ...],
             action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
             action=policy_output.action[:, None],
+            value=root_value[:, None, ...],
         )
         buffer_state = self.buffer.add(state.buffer_state, experience)
 
