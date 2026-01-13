@@ -1,25 +1,29 @@
-[build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "azx"
 version = "0.0.1"
 description = "azx"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-  "jax",
+  "aim",
   "chex",
-  "mctx",
-  "orbax",
   "dm-haiku",
-  "optax",
-  "jumanji",
   "flashbax",
-  "rlax"
+  "jax",
+  "jumanji",
+  "mctx",
+  "optax",
+  "orbax",
+  "rlax",
+  "tqdm",
 ]
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["azx*"]
-

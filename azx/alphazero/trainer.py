@@ -1,8 +1,7 @@
 import dataclasses
 import functools
-from copy import deepcopy
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 import chex
 import flashbax as fbx
@@ -11,69 +10,64 @@ import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
-import rlax
 from flashbax.buffers.trajectory_buffer import (
     TrajectoryBufferSample,
     TrajectoryBufferState,
 )
-from jumanji.env import Environment
-from tqdm import tqdm
 
-from .agent import AlphaZero, Config, ModelState
+from azx.alphazero.agent import AgentState, AlphaZero
+from azx.core.env import init_buffer, reset_envs
+from azx.core.losses import (
+    nstep_value_targets,
+    policy_cross_entropy,
+    support_cross_entropy,
+    trajectory_alive_mask,
+)
+from azx.core.rollout import EvalStats, collect_rollout_step, evaluate_rollout
+from azx.core.training import learn_loop
 
 
 @dataclasses.dataclass
-class TrainConfig(Config):
+class TrainConfig:
     actor_batch_size: int
     train_batch_size: int
-    eval_frequency: int
     gumbel_scale: float
+    eval_frequency: int
     n_step: int
     unroll_steps: int
     max_eval_steps: int
-    avg_return_smoothing: float
     checkpoint_frequency: int
     max_length_buffer: int
     min_length_buffer: int
+    value_loss_weight: float
 
 
 class TrainState(NamedTuple):
-    model: ModelState
-    target_model: ModelState
-    env_states: jax.Array
+    model: AgentState
+    env_states: chex.ArrayTree
     buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
-    avg_return: jax.Array
-    avg_loss: jax.Array
-    avg_pi_loss: jax.Array
-    avg_value_loss: jax.Array
     episode_return: jax.Array
-    num_episodes: jax.Array
     key: jax.Array
     eval_episode_return: chex.ArrayTree
     eval_avg_return: chex.ArrayTree
 
 
-class TimeStep(NamedTuple):
-    obs: jax.Array
-    reward: jax.Array
-    terminal: jax.Array
-    pi: jax.Array
-    action_mask: jax.Array
-    value: jax.Array
+class TrainStats(NamedTuple):
+    loss: jax.Array = jnp.array(jnp.nan)
+    policy_loss: jax.Array = jnp.array(jnp.nan)
+    value_loss: jax.Array = jnp.array(jnp.nan)
+    episode_return: jax.Array = jnp.array(jnp.nan)
 
 
-class AlphaZeroTrainer(AlphaZero):
+class AlphaZeroTrainer:
     def __init__(
         self,
-        env: Environment,
+        agent: AlphaZero,
         config: TrainConfig,
-        network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[chex.ArrayTree], jax.Array],
-        action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
         opt: optax.GradientTransformation,
     ):
-        super().__init__(env, config, network_fn, obs_fn, action_mask_fn)
+        self.agent = agent
         self.opt = opt
         self.config = config
         self.train_checkpointer = ocp.StandardCheckpointer()
@@ -87,43 +81,21 @@ class AlphaZeroTrainer(AlphaZero):
         )
 
     def init(self, key: chex.PRNGKey) -> TrainState:
-        key, subkey = jax.random.split(key)
-        state, _ = self.env.reset(subkey)
-        obs = self.obs_fn(state)[None, ...]
+        reset_key, agent_key = jax.random.split(key)
+        agent_state = self.agent.init(agent_key)
 
-        key, subkey = jax.random.split(key)
-        params, net_state = self.network.init(subkey, obs)
-
-        experience = TimeStep(
-            obs=obs[0],
-            reward=jnp.zeros((), dtype=jnp.float32),
-            terminal=jnp.zeros((), dtype=jnp.bool_),
-            pi=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.float32),
-            action_mask=jnp.zeros((self.env.action_spec.num_values,), dtype=jnp.bool_),
-            value=jnp.zeros((), dtype=jnp.float32),
+        buffer_state = init_buffer(self.agent.adapter, self.buffer)
+        env_states = reset_envs(
+            self.agent.adapter, self.config.actor_batch_size, reset_key
         )
-        buffer_state = self.buffer.init(experience)
-
-        opt_state = self.opt.init(params)
-
-        key, subkey = jax.random.split(key)
-        subkeys = jax.random.split(subkey, self.config.actor_batch_size)
-        env_states, _ = jax.vmap(self.env.reset)(subkeys)
-
-        model = ModelState(params, net_state)
+        opt_state = self.opt.init(agent_state.params)
 
         return TrainState(
-            model=model,
-            target_model=deepcopy(model),
+            model=agent_state,
             env_states=env_states,
             buffer_state=buffer_state,
             opt_state=opt_state,
-            avg_loss=jnp.zeros(self.config.train_batch_size),
-            avg_pi_loss=jnp.zeros(self.config.train_batch_size),
-            avg_value_loss=jnp.zeros(self.config.train_batch_size),
-            avg_return=jnp.zeros(self.config.actor_batch_size),
             episode_return=jnp.zeros(self.config.actor_batch_size),
-            num_episodes=jnp.zeros(self.config.actor_batch_size),
             eval_avg_return=jnp.zeros(self.config.actor_batch_size),
             eval_episode_return=jnp.zeros(self.config.actor_batch_size),
             key=key,
@@ -144,25 +116,25 @@ class AlphaZeroTrainer(AlphaZero):
         obs = exp.obs
         rewards = exp.reward
         terminals = exp.terminal
-        target_pi = exp.pi
+        target_pi = exp.policy
         action_mask = exp.action_mask
         target_mcts_value = exp.value
 
-        discounts = self.config.discount * (1.0 - terminals)
+        discounts = self.agent.config.discount * (1.0 - terminals)
         batch_size = obs.shape[0]
 
         rng, step_rng = jax.random.split(rng)
         step_keys = jax.random.split(step_rng, total_steps)
 
-        support_size = self.support.size
-        num_actions = self.env.action_spec.num_values
+        support_size = self.agent.support.size
+        num_actions = self.agent.adapter.env.action_spec.num_values
 
         def step_fn(carry, t):
             pred_state, v_logits, p_logits = carry
             key = step_keys[t]
 
             obs_t = obs[:, t]
-            (policy_logits_t, value_logits_t), pred_state = self.network.apply(
+            (policy_logits_t, value_logits_t), pred_state = self.agent.network.apply(
                 params, pred_state, key, obs_t
             )
 
@@ -170,16 +142,6 @@ class AlphaZeroTrainer(AlphaZero):
             p_logits = p_logits.at[:, t].set(policy_logits_t)
 
             return (pred_state, v_logits, p_logits), None
-
-        terminals_all = terminals[:, :total_steps]
-        done_cumulative = jnp.cumsum(terminals_all.astype(jnp.int32), axis=1) > 0
-        done_before_all = jnp.concatenate(
-            [
-                jnp.zeros_like(done_cumulative[:, :1], dtype=jnp.bool_),
-                done_cumulative[:, :-1],
-            ],
-            axis=1,
-        )
 
         v_logits_unroll = jnp.zeros(
             (batch_size, total_steps, support_size), dtype=jnp.float32
@@ -194,12 +156,7 @@ class AlphaZeroTrainer(AlphaZero):
             jnp.arange(total_steps),
         )
 
-        nstep_returns = functools.partial(
-            rlax.n_step_bootstrapped_returns,
-            n=n_step,
-            stop_target_gradients=True,
-        )
-        target_z = jax.vmap(nstep_returns)(rewards, discounts, target_mcts_value)
+        target_z = nstep_value_targets(rewards, discounts, target_mcts_value, n_step)
 
         # Slice the first K steps
         target_value_k = target_z[:, :unroll_steps]  # (B, K)
@@ -209,34 +166,25 @@ class AlphaZeroTrainer(AlphaZero):
         target_policy_k = target_pi[:, :unroll_steps]  # (B, K, A)
         mask_k = action_mask[:, :unroll_steps]  # (B, K, A)
 
-        # Masking and normalization in the same style as MuZero
-        masked_policy_logits = jnp.where(
-            mask_k,
+        alive_mask, alive_sum = trajectory_alive_mask(terminals, unroll_steps)
+
+        loss_pi = policy_cross_entropy(
             pred_policy_logits_k,
-            jnp.array(-1e9, dtype=pred_policy_logits_k.dtype),
+            target_policy_k,
+            mask_k,
+            alive_mask,
+            alive_sum,
         )
-        masked_target_policy = target_policy_k * mask_k
-        target_policy_norm = masked_target_policy / (
-            masked_target_policy.sum(-1, keepdims=True) + 1e-9
+
+        loss_v = support_cross_entropy(
+            pred_value_logits_k,
+            target_value_k,
+            self.agent.support,
+            alive_mask,
+            alive_sum,
         )
 
-        # Categorical targets over the value support
-        target_value_prob = self.support.encode(target_value_k)
-
-        alive_mask = (~done_before_all[:, :unroll_steps]).astype(jnp.float32)
-        alive_sum = alive_mask.sum() + 1e-9
-
-        loss_pi = (
-            optax.softmax_cross_entropy(masked_policy_logits, target_policy_norm)
-            * alive_mask
-        ).sum() / alive_sum
-
-        loss_v = (
-            optax.softmax_cross_entropy(pred_value_logits_k, target_value_prob)
-            * alive_mask
-        ).sum() / alive_sum
-
-        total_loss = loss_pi + 0.5 * loss_v
+        total_loss = loss_pi + self.config.value_loss_weight * loss_v
 
         return total_loss, (
             pred_state_new,
@@ -244,28 +192,7 @@ class AlphaZeroTrainer(AlphaZero):
             jax.lax.stop_gradient(loss_pi),
         )
 
-    def _step_env(
-        self, key: chex.PRNGKey, env_states: chex.ArrayTree, actions: jax.Array
-    ) -> tuple[chex.ArrayTree, jax.Array, jax.Array]:
-        env_states, steps = jax.vmap(self.env.step)(env_states, actions)
-        reward = jax.vmap(lambda x: x.reward)(steps)
-        terminal = jax.vmap(lambda x: x.last())(steps)
-
-        subkeys = jax.random.split(key, self.config.actor_batch_size)
-        reset_states, _ = jax.vmap(self.env.reset)(subkeys)
-
-        env_states = jax.vmap(
-            lambda t, reset_state, env_state: jax.lax.cond(
-                t,
-                lambda x: x[0],
-                lambda x: x[1],
-                (reset_state, env_state),
-            )
-        )(terminal, reset_states, env_states)
-
-        return env_states, reward, terminal
-
-    def _train_from_batch(self, state: TrainState) -> TrainState:
+    def _train_from_batch(self, state: TrainState) -> tuple[TrainState, TrainStats]:
         key, subkey = jax.random.split(state.key)
         batch = self.buffer.sample(state.buffer_state, subkey)
 
@@ -276,161 +203,103 @@ class AlphaZeroTrainer(AlphaZero):
         updates, opt_state = self.opt.update(grads, state.opt_state, state.model.params)
         params = optax.apply_updates(state.model.params, updates)
 
-        avg_pi = state.avg_pi_loss * self.config.avg_return_smoothing + loss_pi * (
-            1 - self.config.avg_return_smoothing
-        )
-        avg_v = state.avg_value_loss * self.config.avg_return_smoothing + loss_v * (
-            1 - self.config.avg_return_smoothing
-        )
-        avg = state.avg_loss * self.config.avg_return_smoothing + loss * (
-            1 - self.config.avg_return_smoothing
-        )
+        stats = TrainStats(loss=loss, policy_loss=loss_pi, value_loss=loss_v)
 
         return state._replace(
             key=key,
-            model=ModelState(params=params, state=net_state),
+            model=AgentState(params=params, state=net_state),
             opt_state=opt_state,
-            avg_loss=avg,
-            avg_pi_loss=avg_pi,
-            avg_value_loss=avg_v,
-        )
+        ), stats
 
-    def _actor_step(self, state: TrainState) -> TrainState:
-        key, search_key, step_key = jax.random.split(state.key, 3)
-        obs = jax.vmap(self.obs_fn)(state.env_states)
-        valid_actions = jax.vmap(self.action_mask_fn)(state.env_states)
-
-        policy_output = self._alphazero_search(
-            model=state.model,
-            key=search_key,
-            env_states=state.env_states,
-            gumbel_scale=self.config.gumbel_scale,
+    def _actor_step(self, state: TrainState) -> tuple[TrainState, jax.Array]:
+        key, rollout_key = jax.random.split(state.key)
+        rollout = collect_rollout_step(
+            self.agent.adapter,
+            state.env_states,
+            lambda search_key, env_states: self.agent.search(
+                model=state.model,
+                key=search_key,
+                env_states=env_states,
+                gumbel_scale=self.config.gumbel_scale,
+            ),
+            rollout_key,
         )
-        root_value = policy_output.search_tree.raw_values[
-            :, policy_output.search_tree.ROOT_INDEX
-        ]
-        env_states, reward, terminal = self._step_env(
-            step_key, state.env_states, policy_output.action
-        )
+        buffer_state = self.buffer.add(state.buffer_state, rollout.experience)
 
-        experience = TimeStep(
-            obs=obs[:, None, ...],
-            reward=reward[:, None, ...],
-            terminal=terminal[:, None, ...],
-            pi=policy_output.action_weights[:, None, ...],
-            action_mask=valid_actions.astype(jnp.bool_)[:, None, ...],
-            value=root_value[:, None, ...],
-        )
-        buffer_state = self.buffer.add(state.buffer_state, experience)
+        new_return = state.episode_return + rollout.reward
+        next_episode_return = jnp.where(rollout.terminal, 0, new_return)
 
-        new_return = state.episode_return + reward
-        next_episode_return = jnp.where(terminal, 0, new_return)
-        next_avg_return = jnp.where(
-            terminal,
-            new_return,
-            state.avg_return,
-        )
-        next_num_episodes = state.num_episodes + terminal.astype(jnp.int32)
-
-        return state._replace(
+        state = state._replace(
             key=key,
             buffer_state=buffer_state,
-            env_states=env_states,
+            env_states=rollout.env_states,
             episode_return=next_episode_return,
-            avg_return=next_avg_return,
-            num_episodes=next_num_episodes,
         )
+
+        episode_return = jnp.where(rollout.terminal, new_return, jnp.nan)
+        return state, episode_return
 
     @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
-    def train_step(self, state: TrainState) -> TrainState:
+    def train_step(self, state: TrainState) -> tuple[TrainState, TrainStats]:
         def loop_fn(state: TrainState, _):
-            state = self._actor_step(state)
+            state, episode_return = self._actor_step(state)
 
-            state = jax.lax.cond(
+            state, stats = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
                 self._train_from_batch,
-                lambda st: st,
+                lambda st: (st, TrainStats()),
                 state,
             )
+            stats = stats._replace(episode_return=episode_return)
 
-            return state, None
+            return state, stats
 
-        state, _ = jax.lax.scan(loop_fn, state, None, length=self.config.eval_frequency)
-        return state._replace(target_model=state.model)
-
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def evaluate(self, state: TrainState, max_steps: int) -> jax.Array:
-        def loop_fn(carry):
-            env_states, reward_acc, done_mask, key, iter = carry
-            key, subkey = jax.random.split(key)
-
-            policy_output = self._alphazero_search(state.model, subkey, env_states)
-            action = policy_output.action
-
-            # step the envs
-            next_states, steps = jax.vmap(self.env.step)(env_states, action)
-            r = jax.vmap(lambda ts: ts.reward)(steps)
-            done = jax.vmap(lambda ts: ts.last())(steps)
-
-            # accumulate only for unfinished envs
-            reward_acc = jnp.where(done_mask, reward_acc, reward_acc + r)
-            done_mask = jnp.logical_or(done_mask, done)
-
-            return next_states, reward_acc, done_mask, key, iter + 1
-
-        key, subkey = jax.random.split(state.key)
-        reset_keys = jax.random.split(subkey, self.config.actor_batch_size)
-        env_states, _ = jax.vmap(self.env.reset)(reset_keys)
-
-        reward_acc = jnp.zeros(self.config.actor_batch_size)
-        done_mask = jnp.zeros(self.config.actor_batch_size, dtype=jnp.bool_)
-
-        _, reward_acc, _, _, _ = jax.lax.while_loop(
-            lambda carry: jnp.any(~carry[2])
-            & (carry[4] < max_steps),  # while any not done and iters under max steps
-            loop_fn,
-            (env_states, reward_acc, done_mask, key, 0),
+        state, stats_series = jax.lax.scan(
+            loop_fn, state, None, length=self.config.eval_frequency
         )
 
-        return jnp.mean(reward_acc)
+        stats = jax.tree_util.tree_map(jnp.nanmean, stats_series)
+        return state, stats
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def evaluate(self, state: TrainState) -> EvalStats:
+        return evaluate_rollout(
+            self.agent.adapter,
+            self.config.actor_batch_size,
+            self.config.max_eval_steps,
+            state.key,
+            lambda search_key, env_states: self.agent.search(
+                model=state.model,
+                key=search_key,
+                env_states=env_states,
+            ),
+        )
 
     def learn(
-        self, state: TrainState, num_steps: int, checkpoints_dir: str
-    ) -> tuple[TrainState, list[float], list[int]]:
-        path = Path(checkpoints_dir).resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        returns = []
-        steps = []
-        time_step = 0
-
-        pbar = tqdm(range(num_steps // self.config.eval_frequency), leave=True)
-        for _ in pbar:
-            state = self.train_step(state)
-
-            valid_returns = state.avg_return[state.num_episodes > 0]
-            avg_return = jnp.mean(valid_returns) if valid_returns.size > 0 else 0.0
-            avg_pi_loss = jnp.mean(state.avg_pi_loss)
-            avg_value_loss = jnp.mean(state.avg_value_loss)
-
-            returns.append(avg_return)
-            time_step += self.config.eval_frequency
-            steps.append(time_step)
-            ev = self.evaluate(state, self.config.max_eval_steps)
-
-            pbar.write(
-                f"Step {time_step:06d} | Avg Return: {avg_return:.3f} | Eval: {ev:.3f} | "
-                f"Pi Loss: {avg_pi_loss:.3f} | Value Loss: {avg_value_loss:.3f}",
-            )
-
-            if time_step % self.config.checkpoint_frequency == 0:
-                self.save_checkpoint(state, f"checkpoint-{time_step}", path)
-
-        self.save_checkpoint(state, "checkpoint-final", path)
-
-        print("Saving final checkpoint...", flush=True)
-        self.train_checkpointer.wait_until_finished()
-
-        return state, returns, steps
+        self, state: TrainState, num_steps: int, checkpoints_dir: Path
+    ) -> TrainState:
+        return learn_loop(
+            state=state,
+            eval_frequency=self.config.eval_frequency,
+            checkpoint_frequency=self.config.checkpoint_frequency,
+            num_steps=num_steps,
+            checkpoints_dir=checkpoints_dir,
+            checkpointer=self.train_checkpointer,
+            train_step=self.train_step,
+            evaluate=self.evaluate,
+            build_train_metrics=lambda stats: {
+                "loss/total": stats.loss,
+                "loss/policy": stats.policy_loss,
+                "loss/value": stats.value_loss,
+                "train/avg_return": stats.episode_return,
+            },
+            build_eval_metrics=lambda ev: {"eval/avg_return": ev.episode_return},
+            run_config={
+                "algorithm": "alphazero",
+                "agent_config": dataclasses.asdict(self.agent.config),
+                "train_config": dataclasses.asdict(self.config),
+            },
+        )
 
     def save_checkpoint(self, state: TrainState, filename: str, directory: Path):
         self.train_checkpointer.save(directory / filename, state)

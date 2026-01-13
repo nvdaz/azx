@@ -7,9 +7,9 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import mctx
-from jumanji.env import Environment
 
-from azx.internal.support import DiscreteSupport
+from azx.core.env import EnvironmentAdapter
+from azx.core.support import ScaledSupport
 
 
 @dataclasses.dataclass
@@ -23,7 +23,7 @@ class Config:
     support_eps: float
 
 
-class ModelState(NamedTuple):
+class AgentState(NamedTuple):
     params: hk.MutableParams
     state: hk.MutableState
 
@@ -31,39 +31,42 @@ class ModelState(NamedTuple):
 class AlphaZero:
     def __init__(
         self,
-        env: Environment,
+        adapter: EnvironmentAdapter,
         config: Config,
         network_fn: Callable[[jax.Array], tuple[jax.Array, jax.Array]],
-        obs_fn: Callable[[chex.ArrayTree], jax.Array],
-        action_mask_fn: Callable[[chex.ArrayTree], jax.Array],
     ):
-        self.env = env
+        self.adapter = adapter
         self.config = config
         self.network = hk.transform_with_state(network_fn)
-        self.obs_fn = obs_fn
-        self.action_mask_fn = action_mask_fn
-        self.support = DiscreteSupport(
+        self.support = ScaledSupport(
             min_val=config.support_min,
             max_val=config.support_max,
             eps=config.support_eps,
         )
 
+    def init(self, key: chex.PRNGKey) -> AgentState:
+        reset_key, net_key = jax.random.split(key)
+        state, _ = self.adapter.env.reset(reset_key)
+        obs = self.adapter.obs_fn(state)
+        params, net_state = self.network.init(net_key, obs)
+        return AgentState(params=params, state=net_state)
+
     def _recurrent_fn(
         self,
-        model: ModelState,
+        model: AgentState,
         key: chex.PRNGKey,
         actions: jax.Array,
         env_states: jax.Array,
     ):
-        env_states, steps = jax.vmap(self.env.step)(env_states, actions)
-        obs = jax.vmap(self.obs_fn)(env_states)
+        env_states, steps = jax.vmap(self.adapter.env.step)(env_states, actions)
+        obs = jax.vmap(self.adapter.obs_fn)(env_states)
         rewards = jax.vmap(lambda x: x.reward)(steps)
         terminals = jax.vmap(lambda x: x.last())(steps)
 
         (pi_logits, value_logits), _ = self.network.apply(
             model.params, model.state, key, obs
         )
-        mask = jax.vmap(self.action_mask_fn)(env_states)
+        mask = jax.vmap(self.adapter.action_mask_fn)(env_states)
         pi_logits = jnp.where(mask, pi_logits, -jnp.inf)
         value = self.support.decode_logits(value_logits)
 
@@ -77,19 +80,19 @@ class AlphaZero:
             env_states,
         )
 
-    def _alphazero_search(
+    def search(
         self,
-        model: ModelState,
+        model: AgentState,
         key: chex.PRNGKey,
-        env_states: jax.Array,
+        env_states: chex.ArrayTree,
         gumbel_scale: float = 0.0,
     ) -> mctx.PolicyOutput:
-        obs = jax.vmap(self.obs_fn)(env_states)
+        obs = jax.vmap(self.adapter.obs_fn)(env_states)
         key, apply_key, mcts_key = jax.random.split(key, 3)
         (pi_logits, value_logits), _ = self.network.apply(
             model.params, model.state, apply_key, obs
         )
-        valid_actions = jax.vmap(self.action_mask_fn)(env_states)
+        valid_actions = jax.vmap(self.adapter.action_mask_fn)(env_states)
         value = self.support.decode_logits(value_logits)
 
         root = mctx.RootFnOutput(
@@ -107,7 +110,7 @@ class AlphaZero:
             invalid_actions=invalid_actions,
             recurrent_fn=self._recurrent_fn,
             num_simulations=self.config.num_simulations,
-            max_num_considered_actions=self.env.action_spec.num_values,
+            max_num_considered_actions=self.adapter.env.action_spec.num_values,
             qtransform=functools.partial(
                 mctx.qtransform_completed_by_mix_value,
                 use_mixed_value=self.config.use_mixed_value,
@@ -118,12 +121,10 @@ class AlphaZero:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
-        self, model: ModelState, key: chex.PRNGKey, env_state: chex.ArrayTree
+        self, model: AgentState, key: chex.PRNGKey, env_state: chex.ArrayTree
     ) -> jax.Array:
         env_states = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), env_state)
 
-        policy_output = self._alphazero_search(
-            model=model, key=key, env_states=env_states
-        )
+        policy_output = self.search(model=model, key=key, env_states=env_states)
 
         return policy_output.action[0]

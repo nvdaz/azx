@@ -1,4 +1,4 @@
-import pathlib
+from pathlib import Path
 
 import haiku as hk
 import jax
@@ -8,28 +8,32 @@ from jumanji.environments.routing.maze.env import Maze
 from jumanji.environments.routing.maze.generator import RandomGenerator
 from jumanji.environments.routing.maze.types import State
 
+from azx.alphazero.agent import AlphaZero, Config
 from azx.alphazero.trainer import AlphaZeroTrainer, TrainConfig
+from azx.core.env import EnvironmentAdapter
 
-config = TrainConfig(
+config = Config(
     discount=0.99,
+    num_simulations=5,
     use_mixed_value=True,
     value_scale=1.0,
-    actor_batch_size=128,
-    train_batch_size=64,
-    n_step=8,
-    unroll_steps=4,
-    avg_return_smoothing=0.99,
-    num_simulations=25,
-    target_ema=0.005,
-    eval_frequency=1000,
-    max_eval_steps=100,
-    checkpoint_frequency=100000,
-    gumbel_scale=0.0,
-    max_length_buffer=1024,
-    min_length_buffer=64,
     support_min=-1,
     support_max=1,
     support_eps=0.001,
+)
+
+train_config = TrainConfig(
+    actor_batch_size=128,
+    train_batch_size=64,
+    n_step=5,
+    unroll_steps=4,
+    eval_frequency=50,
+    max_eval_steps=100,
+    checkpoint_frequency=100000,
+    gumbel_scale=0.5,
+    max_length_buffer=1024,
+    min_length_buffer=64,
+    value_loss_weight=0.5,
 )
 
 
@@ -89,23 +93,27 @@ def action_mask_fn(state):
     return state.action_mask
 
 
-trainer = AlphaZeroTrainer(
+adapter: EnvironmentAdapter[State] = EnvironmentAdapter(
     env=env,
+    obs_fn=flatten_observation,
+    action_mask_fn=action_mask_fn,
+)
+
+agent = AlphaZero(
+    adapter=adapter,
     config=config,
     network_fn=lambda obs: MLP(action_dim)(obs),
-    action_mask_fn=action_mask_fn,
-    obs_fn=flatten_observation,
-    opt=optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4)),
+)
+
+trainer = AlphaZeroTrainer(
+    agent=agent,
+    config=train_config,
+    opt=optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-4)),
 )
 
 key = jax.random.PRNGKey(0)
 state = trainer.init(key)
 
-checkpoints_dir = pathlib.Path("./checkpoints")
-checkpoints_dir.mkdir(exist_ok=True)
-
-state, returns, steps = trainer.learn(
-    state=state,
-    num_steps=100000,
-    checkpoints_dir="./checkpoints",
+state = trainer.learn(
+    state=state, num_steps=100000, checkpoints_dir=Path("./checkpoints")
 )

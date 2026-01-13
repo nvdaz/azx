@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import mctx
 
-from azx.internal.support import DiscreteSupport
+from azx.core.support import ScaledSupport
 
 
 @dataclasses.dataclass
@@ -51,7 +51,7 @@ class MuZero:
         self.rep_net = hk.transform_with_state(representation_fn)
         self.dyn_net = hk.transform_with_state(dynamics_fn)
         self.pred_net = hk.transform_with_state(prediction_fn)
-        self.support = DiscreteSupport(
+        self.support = ScaledSupport(
             min_val=config.support_min,
             max_val=config.support_max,
             eps=config.support_eps,
@@ -84,7 +84,7 @@ class MuZero:
             next_latent,
         )
 
-    def _muzero_search(
+    def search(
         self,
         model: ModelState,
         key: chex.PRNGKey,
@@ -122,6 +122,24 @@ class MuZero:
             gumbel_scale=gumbel_scale,
         )
 
+    def init(self, key: chex.PRNGKey, obs: jax.Array) -> ModelState:
+        key, rep_key = jax.random.split(key)
+        rep_params, rep_state = self.rep_net.init(rep_key, obs)
+
+        key, subkey = jax.random.split(key)
+        dummy_latent, _ = self.rep_net.apply(rep_params, rep_state, subkey, obs)
+        dummy_action = jnp.zeros((1,), dtype=jnp.int32)
+
+        key, dyn_key = jax.random.split(key)
+        dyn_params, dyn_state = self.dyn_net.init(dyn_key, dummy_latent, dummy_action)
+
+        key, pred_key = jax.random.split(key)
+        pred_params, pred_state = self.pred_net.init(pred_key, dummy_latent)
+
+        params = ModelParams(rep=rep_params, dyn=dyn_params, pred=pred_params)
+        net_state = ModelNetState(rep=rep_state, dyn=dyn_state, pred=pred_state)
+        return ModelState(params=params, state=net_state)
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
         self,
@@ -130,7 +148,7 @@ class MuZero:
         obs: jax.Array,
         valid_actions: jax.Array,
     ) -> jax.Array:
-        policy_output = self._muzero_search(
+        policy_output = self.search(
             model=model,
             key=key,
             obs=obs[None, ...],
