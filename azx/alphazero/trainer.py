@@ -48,9 +48,8 @@ class TrainState(NamedTuple):
     buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
     episode_return: jax.Array
+    episode_steps: jax.Array
     key: jax.Array
-    eval_episode_return: chex.ArrayTree
-    eval_avg_return: chex.ArrayTree
 
 
 class TrainStats(NamedTuple):
@@ -58,6 +57,7 @@ class TrainStats(NamedTuple):
     policy_loss: jax.Array = jnp.array(jnp.nan)
     value_loss: jax.Array = jnp.array(jnp.nan)
     episode_return: jax.Array = jnp.array(jnp.nan)
+    episode_steps: jax.Array = jnp.array(jnp.nan)
 
 
 class AlphaZeroTrainer:
@@ -96,8 +96,7 @@ class AlphaZeroTrainer:
             buffer_state=buffer_state,
             opt_state=opt_state,
             episode_return=jnp.zeros(self.config.actor_batch_size),
-            eval_avg_return=jnp.zeros(self.config.actor_batch_size),
-            eval_episode_return=jnp.zeros(self.config.actor_batch_size),
+            episode_steps=jnp.zeros(self.config.actor_batch_size),
             key=key,
         )
 
@@ -211,7 +210,7 @@ class AlphaZeroTrainer:
             opt_state=opt_state,
         ), stats
 
-    def _actor_step(self, state: TrainState) -> tuple[TrainState, jax.Array]:
+    def _actor_step(self, state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
         key, rollout_key = jax.random.split(state.key)
         rollout = collect_rollout_step(
             self.agent.adapter,
@@ -227,22 +226,26 @@ class AlphaZeroTrainer:
         buffer_state = self.buffer.add(state.buffer_state, rollout.experience)
 
         new_return = state.episode_return + rollout.reward
+        new_steps = state.episode_steps + 1
         next_episode_return = jnp.where(rollout.terminal, 0, new_return)
+        next_episode_steps = jnp.where(rollout.terminal, 0, new_steps)
 
         state = state._replace(
             key=key,
             buffer_state=buffer_state,
             env_states=rollout.env_states,
             episode_return=next_episode_return,
+            episode_steps=next_episode_steps,
         )
 
         episode_return = jnp.where(rollout.terminal, new_return, jnp.nan)
-        return state, episode_return
+        episode_steps = jnp.where(rollout.terminal, new_steps, jnp.nan)
+        return state, episode_return, episode_steps
 
     @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def train_step(self, state: TrainState) -> tuple[TrainState, TrainStats]:
         def loop_fn(state: TrainState, _):
-            state, episode_return = self._actor_step(state)
+            state, episode_return, episode_steps = self._actor_step(state)
 
             state, stats = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
@@ -250,7 +253,9 @@ class AlphaZeroTrainer:
                 lambda st: (st, TrainStats()),
                 state,
             )
-            stats = stats._replace(episode_return=episode_return)
+            stats = stats._replace(
+                episode_return=episode_return, episode_steps=episode_steps
+            )
 
             return state, stats
 
@@ -292,8 +297,12 @@ class AlphaZeroTrainer:
                 "loss/policy": stats.policy_loss,
                 "loss/value": stats.value_loss,
                 "train/avg_return": stats.episode_return,
+                "train/avg_steps": stats.episode_steps,
             },
-            build_eval_metrics=lambda ev: {"eval/avg_return": ev.episode_return},
+            build_eval_metrics=lambda ev: {
+                "eval/avg_return": ev.episode_return,
+                "eval/avg_steps": ev.episode_steps,
+            },
             run_config={
                 "algorithm": "alphazero",
                 "agent_config": dataclasses.asdict(self.agent.config),

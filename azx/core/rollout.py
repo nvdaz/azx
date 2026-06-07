@@ -12,6 +12,7 @@ SearchFn = Callable[[chex.PRNGKey, chex.ArrayTree], PolicyOutput]
 
 class EvalStats(NamedTuple):
     episode_return: jax.Array = jnp.array(jnp.nan)
+    episode_steps: jax.Array = jnp.array(jnp.nan)
 
 
 class RolloutStep(NamedTuple):
@@ -68,7 +69,7 @@ def evaluate_rollout(
     search_fn: SearchFn,
 ) -> EvalStats:
     def loop_fn(carry):
-        env_states, reward_acc, done_mask, key, iter = carry
+        env_states, reward_acc, steps_acc, done_mask, key, iter = carry
         key, subkey = jax.random.split(key)
 
         policy = search_fn(subkey, env_states)
@@ -77,21 +78,25 @@ def evaluate_rollout(
         done = jax.vmap(lambda ts: ts.last())(steps)
 
         reward_acc = jnp.where(done_mask, reward_acc, reward_acc + r)
+        steps_acc = jnp.where(done_mask, steps_acc, steps_acc + 1)
         done_mask = jnp.logical_or(done_mask, done)
 
-        return next_states, reward_acc, done_mask, key, iter + 1
+        return next_states, reward_acc, steps_acc, done_mask, key, iter + 1
 
     key, subkey = jax.random.split(key)
     reset_keys = jax.random.split(subkey, actor_batch_size)
     env_states, _ = jax.vmap(adapter.env.reset)(reset_keys)
 
     reward_acc = jnp.zeros(actor_batch_size)
+    steps_acc = jnp.zeros(actor_batch_size, dtype=jnp.int32)
     done_mask = jnp.zeros(actor_batch_size, dtype=jnp.bool_)
 
-    _, reward_acc, _, _, _ = jax.lax.while_loop(
-        lambda carry: jnp.any(~carry[2]) & (carry[4] < max_steps),
+    _, reward_acc, steps_acc, _, _, _ = jax.lax.while_loop(
+        lambda carry: jnp.any(~carry[3]) & (carry[5] < max_steps),
         loop_fn,
-        (env_states, reward_acc, done_mask, key, 0),
+        (env_states, reward_acc, steps_acc, done_mask, key, 0),
     )
 
-    return EvalStats(episode_return=jnp.mean(reward_acc))
+    return EvalStats(
+        episode_return=jnp.mean(reward_acc), episode_steps=jnp.mean(steps_acc)
+    )

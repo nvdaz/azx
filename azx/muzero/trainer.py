@@ -62,6 +62,7 @@ class TrainConfig:
     min_length_buffer: int
     consistency_loss_weight: float
     value_loss_weight: float
+    replay_ratio: int = 1
 
 
 class TrainState(NamedTuple):
@@ -70,9 +71,8 @@ class TrainState(NamedTuple):
     buffer_state: TrajectoryBufferState
     opt_state: optax.OptState
     episode_return: jax.Array
+    episode_steps: jax.Array
     key: jax.Array
-    eval_episode_return: chex.ArrayTree
-    eval_avg_return: chex.ArrayTree
 
 
 class TrainStats(NamedTuple):
@@ -82,6 +82,7 @@ class TrainStats(NamedTuple):
     reward_loss: jax.Array = jnp.array(jnp.nan)
     consistency_loss: jax.Array = jnp.array(jnp.nan)
     episode_return: jax.Array = jnp.array(jnp.nan)
+    episode_steps: jax.Array = jnp.array(jnp.nan)
 
 
 TState = TypeVar("TState")
@@ -130,8 +131,7 @@ class MuZeroTrainer(Generic[TState]):
             env_states=env_states,
             opt_state=opt_state,
             episode_return=jnp.zeros(self.config.actor_batch_size),
-            eval_avg_return=jnp.zeros(self.config.actor_batch_size),
-            eval_episode_return=jnp.zeros(self.config.actor_batch_size),
+            episode_steps=jnp.zeros(self.config.actor_batch_size),
             key=key,
         )
 
@@ -159,8 +159,10 @@ class MuZeroTrainer(Generic[TState]):
             step_key,
         )
         discounts = self.agent.config.discount * (1.0 - exp.terminal)
+        # rlax n_step_bootstrapped_returns expects v_t[i] = V(s_{i+1}),
+        # but exp.value[i] = V(s_i). Shift values by 1 to align correctly.
         target_z = nstep_value_targets(
-            exp.reward, discounts, exp.value, self.config.n_step
+            exp.reward[:, :-1], discounts[:, :-1], exp.value[:, 1:], self.config.n_step
         )
         targets = _Targets(
             value_targets=target_z[:, :num_predictions],
@@ -284,17 +286,12 @@ class MuZeroTrainer(Generic[TState]):
         alive_mask, alive_sum = trajectory_alive_mask(exp.terminal, unroll_steps + 1)
         rep_keys = jax.random.split(key, unroll_steps)
 
-        unroll_lengths = alive_mask.sum(axis=1, keepdims=True)
-        step_scale = jnp.ones_like(alive_mask)
-        step_scale = step_scale.at[:, 1:].set(unroll_lengths)
-
         loss_pi = policy_cross_entropy(
             targets.policy_logits,
             targets.policy_targets,
             targets.action_mask,
             alive_mask,
             alive_sum,
-            per_step_scale=step_scale,
         )
         loss_v = support_cross_entropy(
             targets.value_logits,
@@ -302,7 +299,6 @@ class MuZeroTrainer(Generic[TState]):
             self.agent.support,
             alive_mask,
             alive_sum,
-            per_step_scale=step_scale,
         )
         loss_r = support_cross_entropy(
             targets.reward_logits,
@@ -310,7 +306,6 @@ class MuZeroTrainer(Generic[TState]):
             self.agent.support,
             alive_mask,
             alive_sum,
-            per_step_scale=step_scale,
         )
         loss_consistency, rep_state_final = self._consistency_loss(
             params,
@@ -402,7 +397,7 @@ class MuZeroTrainer(Generic[TState]):
             opt_state=opt_state,
         ), stats
 
-    def _actor_step(self, state: TrainState) -> tuple[TrainState, jax.Array]:
+    def _actor_step(self, state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
         key, rollout_key = jax.random.split(state.key)
         rollout = collect_rollout_step(
             self.adapter,
@@ -418,29 +413,43 @@ class MuZeroTrainer(Generic[TState]):
         buffer_state = self.buffer.add(state.buffer_state, rollout.experience)
 
         new_return = state.episode_return + rollout.reward
+        new_steps = state.episode_steps + 1
         next_episode_return = jnp.where(rollout.terminal, 0, new_return)
+        next_episode_steps = jnp.where(rollout.terminal, 0, new_steps)
 
         state = state._replace(
             key=key,
             buffer_state=buffer_state,
             env_states=rollout.env_states,
             episode_return=next_episode_return,
+            episode_steps=next_episode_steps,
         )
         episode_return = jnp.where(rollout.terminal, new_return, jnp.nan)
-        return state, episode_return
+        episode_steps = jnp.where(rollout.terminal, new_steps, jnp.nan)
+        return state, episode_return, episode_steps
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(1,))
     def train_step(self, state: TrainState) -> tuple[TrainState, TrainStats]:
         def loop_fn(state: TrainState, _):
-            state, episode_return = self._actor_step(state)
+            state, episode_return, episode_steps = self._actor_step(state)
+
+            def _multi_train(st):
+                def inner(st, _):
+                    return self._train_from_batch(st)
+
+                st, stats = jax.lax.scan(inner, st, None, self.config.replay_ratio)
+                stats = jax.tree_util.tree_map(jnp.mean, stats)
+                return st, stats
 
             state, stats = jax.lax.cond(
                 self.buffer.can_sample(state.buffer_state),
-                self._train_from_batch,
+                _multi_train,
                 lambda st: (st, TrainStats()),
                 state,
             )
-            stats = stats._replace(episode_return=episode_return)
+            stats = stats._replace(
+                episode_return=episode_return, episode_steps=episode_steps
+            )
 
             return state, stats
 
@@ -483,8 +492,12 @@ class MuZeroTrainer(Generic[TState]):
                 "loss/reward": stats.reward_loss,
                 "loss/consistency": stats.consistency_loss,
                 "train/avg_return": stats.episode_return,
+                "train/avg_steps": stats.episode_steps,
             },
-            build_eval_metrics=lambda ev: {"eval/avg_return": ev.episode_return},
+            build_eval_metrics=lambda ev: {
+                "eval/avg_return": ev.episode_return,
+                "eval/avg_steps": ev.episode_steps,
+            },
             run_config={
                 "algorithm": "muzero",
                 "agent_config": dataclasses.asdict(self.agent.config),
